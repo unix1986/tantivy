@@ -68,7 +68,9 @@ impl<T> Pool<T> {
     /// After publish, all new `Searcher` acquired will be
     /// of the new generation.
     pub fn publish_new_generation(&self, items: Vec<T>) {
+        assert!(!items.is_empty());
         let next_generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let num_items = items.len();
         for item in items {
             let gen_item = GenerationItem {
                 item,
@@ -77,6 +79,23 @@ impl<T> Pool<T> {
             self.queue.push(gen_item);
         }
         self.advertise_generation(next_generation);
+        // Purge possible previous searchers.
+        //
+        // Assuming at this point no searcher is held more than duration T by the user,
+        // this guarantees that an obsolete searcher will not be uselessly held (and its associated
+        // mmap) for more than duration T.
+        //
+        // Proof: At this point, obsolete searcher that are held by the user will be held for less
+        // than T. When released, they will be dropped as their generation is detected obsolete.
+        //
+        // We still need to ensure that the searcher that are obsolete and in the pool get removed.
+        // The queue currently contains up to 2n searchers, in any random order.
+        //
+        // Half of them are obsoletes. By requesting `(n+1)` fresh searchers, we ensure that all
+        // searcher will be inspected.
+        for _ in 0..=num_items {
+            let _ = self.acquire();
+        }
     }
 
     /// At the exit of this method,
@@ -123,6 +142,10 @@ impl<T> Pool<T> {
     }
 }
 
+/// A LeasedItem holds an object borrowed from a Pool.
+///
+/// Upon drop, the object is automatically returned
+/// into the pool.
 pub struct LeasedItem<T> {
     gen_item: Option<GenerationItem<T>>,
     recycle_queue: Arc<Queue<GenerationItem<T>>>,
@@ -163,7 +186,7 @@ mod tests {
 
     use super::Pool;
     use super::Queue;
-    use std::iter;
+    use std::{iter, mem};
 
     #[test]
     fn test_pool() {
@@ -193,33 +216,67 @@ mod tests {
     fn test_pool_dont_panic_on_empty_pop() {
         // When the object pool is exhausted, it shouldn't panic on pop()
         use std::sync::Arc;
-        use std::{thread, time};
+        use std::thread;
 
         // Wrap the pool in an Arc, same way as its used in `core/index.rs`
-        let pool = Arc::new(Pool::new());
+        let pool1 = Arc::new(Pool::new());
         // clone pools outside the move scope of each new thread
-        let pool1 = Arc::clone(&pool);
-        let pool2 = Arc::clone(&pool);
+        let pool2 = Arc::clone(&pool1);
+        let pool3 = Arc::clone(&pool1);
+
         let elements_for_pool = vec![1, 2];
-        pool.publish_new_generation(elements_for_pool);
+        pool1.publish_new_generation(elements_for_pool);
 
         let mut threads = vec![];
-        let sleep_dur = time::Duration::from_millis(10);
         // spawn one more thread than there are elements in the pool
+
+        let (start_1_send, start_1_recv) = crossbeam::bounded(0);
+        let (start_2_send, start_2_recv) = crossbeam::bounded(0);
+        let (start_3_send, start_3_recv) = crossbeam::bounded(0);
+
+        let (event_send1, event_recv) = crossbeam::unbounded();
+        let event_send2 = event_send1.clone();
+        let event_send3 = event_send1.clone();
+
         threads.push(thread::spawn(move || {
-            // leasing to make sure it's not dropped before sleep is called
-            let _leased_searcher = &pool.acquire();
-            thread::sleep(sleep_dur);
-        }));
-        threads.push(thread::spawn(move || {
-            // leasing to make sure it's not dropped before sleep is called
+            assert_eq!(start_1_recv.recv(), Ok("start"));
             let _leased_searcher = &pool1.acquire();
-            thread::sleep(sleep_dur);
+            assert!(event_send1.send("1 acquired").is_ok());
+            assert_eq!(start_1_recv.recv(), Ok("stop"));
+            assert!(event_send1.send("1 stopped").is_ok());
+            mem::drop(_leased_searcher);
         }));
+
         threads.push(thread::spawn(move || {
-            // leasing to make sure it's not dropped before sleep is called
+            assert_eq!(start_2_recv.recv(), Ok("start"));
             let _leased_searcher = &pool2.acquire();
-            thread::sleep(sleep_dur);
+            assert!(event_send2.send("2 acquired").is_ok());
+            assert_eq!(start_2_recv.recv(), Ok("stop"));
+            mem::drop(_leased_searcher);
+            assert!(event_send2.send("2 stopped").is_ok());
         }));
+
+        threads.push(thread::spawn(move || {
+            assert_eq!(start_3_recv.recv(), Ok("start"));
+            let _leased_searcher = &pool3.acquire();
+            assert!(event_send3.send("3 acquired").is_ok());
+            assert_eq!(start_3_recv.recv(), Ok("stop"));
+            mem::drop(_leased_searcher);
+            assert!(event_send3.send("3 stopped").is_ok());
+        }));
+
+        assert!(start_1_send.send("start").is_ok());
+        assert_eq!(event_recv.recv(), Ok("1 acquired"));
+        assert!(start_2_send.send("start").is_ok());
+        assert_eq!(event_recv.recv(), Ok("2 acquired"));
+        assert!(start_3_send.send("start").is_ok());
+        assert!(event_recv.try_recv().is_err());
+        assert!(start_1_send.send("stop").is_ok());
+        assert_eq!(event_recv.recv(), Ok("1 stopped"));
+        assert_eq!(event_recv.recv(), Ok("3 acquired"));
+        assert!(start_3_send.send("stop").is_ok());
+        assert_eq!(event_recv.recv(), Ok("3 stopped"));
+        assert!(start_2_send.send("stop").is_ok());
+        assert_eq!(event_recv.recv(), Ok("2 stopped"));
     }
 }

@@ -14,6 +14,9 @@ lexicographical order matches the natural order of integers.
 `i64`-terms are transformed to `u64` using a continuous mapping `val ⟶ val - i64::min_value()`
 and then treated as a `u64`.
 
+`f64`-terms are transformed to `u64` using a mapping that preserve order, and are then treated
+as `u64`.
+
 A second datastructure makes it possible to access a [`TermInfo`](../postings/struct.TermInfo.html).
 */
 
@@ -35,7 +38,7 @@ mod tests {
     use crate::core::Index;
     use crate::directory::{Directory, RAMDirectory, ReadOnlySource};
     use crate::postings::TermInfo;
-    use crate::schema::{Document, FieldType, Schema, TEXT};
+    use crate::schema::{Document, Schema, TEXT};
     use std::path::PathBuf;
     use std::str;
 
@@ -47,6 +50,12 @@ mod tests {
             positions_idx: val * 2u64,
             postings_offset: val * 3u64,
         }
+    }
+
+    #[test]
+    fn test_empty_term_dictionary() {
+        let empty = TermDictionary::empty();
+        assert!(empty.stream().next().is_none());
     }
 
     #[test]
@@ -64,9 +73,7 @@ mod tests {
         let path = PathBuf::from("TermDictionary");
         {
             let write = directory.open_write(&path).unwrap();
-            let field_type = FieldType::Str(TEXT);
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(write, &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(write).unwrap();
             for term in COUNTRIES.iter() {
                 term_dictionary_builder
                     .insert(term.as_bytes(), &make_term_info(0u64))
@@ -90,9 +97,7 @@ mod tests {
         let path = PathBuf::from("TermDictionary");
         {
             let write = directory.open_write(&path).unwrap();
-            let field_type = FieldType::Str(TEXT);
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(write, &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(write).unwrap();
             term_dictionary_builder
                 .insert("abc".as_bytes(), &make_term_info(34u64))
                 .unwrap();
@@ -176,10 +181,8 @@ mod tests {
         let ids: Vec<_> = (0u32..10_000u32)
             .map(|i| (format!("doc{:0>6}", i), i))
             .collect();
-        let field_type = FieldType::Str(TEXT);
         let buffer: Vec<u8> = {
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(vec![], &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(vec![]).unwrap();
             for &(ref id, ref i) in &ids {
                 term_dictionary_builder
                     .insert(id.as_bytes(), &make_term_info(*i as u64))
@@ -206,10 +209,8 @@ mod tests {
 
     #[test]
     fn test_stream_high_range_prefix_suffix() {
-        let field_type = FieldType::Str(TEXT);
         let buffer: Vec<u8> = {
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(vec![], &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(vec![]).unwrap();
             // term requires more than 16bits
             term_dictionary_builder
                 .insert("abcdefghijklmnopqrstuvwxy", &make_term_info(1))
@@ -241,10 +242,8 @@ mod tests {
         let ids: Vec<_> = (0u32..10_000u32)
             .map(|i| (format!("doc{:0>6}", i), i))
             .collect();
-        let field_type = FieldType::Str(TEXT);
         let buffer: Vec<u8> = {
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(vec![], &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(vec![]).unwrap();
             for &(ref id, ref i) in &ids {
                 term_dictionary_builder
                     .insert(id.as_bytes(), &make_term_info(*i as u64))
@@ -310,10 +309,8 @@ mod tests {
 
     #[test]
     fn test_empty_string() {
-        let field_type = FieldType::Str(TEXT);
         let buffer: Vec<u8> = {
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(vec![], &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(vec![]).unwrap();
             term_dictionary_builder
                 .insert(&[], &make_term_info(1 as u64))
                 .unwrap();
@@ -334,10 +331,8 @@ mod tests {
 
     #[test]
     fn test_stream_range_boundaries() {
-        let field_type = FieldType::Str(TEXT);
         let buffer: Vec<u8> = {
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(vec![], &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(vec![]).unwrap();
             for i in 0u8..10u8 {
                 let number_arr = [i; 1];
                 term_dictionary_builder
@@ -349,47 +344,98 @@ mod tests {
         let source = ReadOnlySource::from(buffer);
         let term_dictionary: TermDictionary = TermDictionary::from_source(&source);
 
-        let value_list = |mut streamer: TermStreamer<'_>| {
+        let value_list = |mut streamer: TermStreamer<'_>, backwards: bool| {
             let mut res: Vec<u32> = vec![];
             while let Some((_, ref v)) = streamer.next() {
                 res.push(v.doc_freq);
             }
+            if backwards {
+                res.reverse();
+            }
             res
         };
         {
+            let range = term_dictionary.range().backward().into_stream();
+            assert_eq!(
+                value_list(range, true),
+                vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32]
+            );
+        }
+        {
             let range = term_dictionary.range().ge([2u8]).into_stream();
             assert_eq!(
-                value_list(range),
+                value_list(range, false),
+                vec![2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32]
+            );
+        }
+        {
+            let range = term_dictionary.range().ge([2u8]).backward().into_stream();
+            assert_eq!(
+                value_list(range, true),
                 vec![2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32]
             );
         }
         {
             let range = term_dictionary.range().gt([2u8]).into_stream();
             assert_eq!(
-                value_list(range),
+                value_list(range, false),
+                vec![3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32]
+            );
+        }
+        {
+            let range = term_dictionary.range().gt([2u8]).backward().into_stream();
+            assert_eq!(
+                value_list(range, true),
                 vec![3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32]
             );
         }
         {
             let range = term_dictionary.range().lt([6u8]).into_stream();
-            assert_eq!(value_list(range), vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32]);
+            assert_eq!(
+                value_list(range, false),
+                vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32]
+            );
+        }
+        {
+            let range = term_dictionary.range().lt([6u8]).backward().into_stream();
+            assert_eq!(
+                value_list(range, true),
+                vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32]
+            );
         }
         {
             let range = term_dictionary.range().le([6u8]).into_stream();
             assert_eq!(
-                value_list(range),
+                value_list(range, false),
+                vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32]
+            );
+        }
+        {
+            let range = term_dictionary.range().le([6u8]).backward().into_stream();
+            assert_eq!(
+                value_list(range, true),
                 vec![0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32]
             );
         }
         {
             let range = term_dictionary.range().ge([0u8]).lt([5u8]).into_stream();
-            assert_eq!(value_list(range), vec![0u32, 1u32, 2u32, 3u32, 4u32]);
+            assert_eq!(value_list(range, false), vec![0u32, 1u32, 2u32, 3u32, 4u32]);
+        }
+        {
+            let range = term_dictionary
+                .range()
+                .ge([0u8])
+                .lt([5u8])
+                .backward()
+                .into_stream();
+            assert_eq!(value_list(range, true), vec![0u32, 1u32, 2u32, 3u32, 4u32]);
         }
     }
 
     #[test]
     fn test_automaton_search() {
         use levenshtein_automata::LevenshteinAutomatonBuilder;
+        use crate::query::DFAWrapper;
 
         const COUNTRIES: [&'static str; 7] = [
             "San Marino",
@@ -405,9 +451,7 @@ mod tests {
         let path = PathBuf::from("TermDictionary");
         {
             let write = directory.open_write(&path).unwrap();
-            let field_type = FieldType::Str(TEXT);
-            let mut term_dictionary_builder =
-                TermDictionaryBuilder::create(write, &field_type).unwrap();
+            let mut term_dictionary_builder = TermDictionaryBuilder::create(write).unwrap();
             for term in COUNTRIES.iter() {
                 term_dictionary_builder
                     .insert(term.as_bytes(), &make_term_info(0u64))
@@ -420,7 +464,7 @@ mod tests {
 
         // We can now build an entire dfa.
         let lev_automaton_builder = LevenshteinAutomatonBuilder::new(2, true);
-        let automaton = lev_automaton_builder.build_dfa("Spaen");
+        let automaton = DFAWrapper(lev_automaton_builder.build_dfa("Spaen"));
 
         let mut range = term_dict.search(automaton).into_stream();
 

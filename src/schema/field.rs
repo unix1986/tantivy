@@ -1,16 +1,28 @@
 use crate::common::BinarySerializable;
+use serde;
 use std::io;
 use std::io::Read;
 use std::io::Write;
 
-/// `Field` is actually a `u8` identifying a `Field`
-/// The schema is in charge of holding mapping between field names
-/// to `Field` objects.
-///
-/// Because the field id is a `u8`, tantivy can only have at most `255` fields.
-/// Value 255 is reserved.
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
-pub struct Field(pub u32);
+/// `Field` is represented by an unsigned 32-bit integer type
+/// The schema holds the mapping between field names and `Field` objects.
+#[derive(
+    Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct Field(u32);
+
+impl Field {
+    /// Create a new field object for the given FieldId.
+    pub fn from_field_id(field_id: u32) -> Field {
+        Field(field_id)
+    }
+
+    /// Returns a u32 identifying uniquely a field within a schema.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn field_id(&self) -> u32 {
+        self.0
+    }
+}
 
 impl BinarySerializable for Field {
     fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {

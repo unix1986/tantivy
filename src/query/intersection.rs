@@ -45,7 +45,7 @@ pub fn intersect_scorers(mut scorers: Vec<Box<dyn Scorer>>) -> Box<dyn Scorer> {
     })
 }
 
-/// Creates a `DocSet` that iterator through the intersection of two `DocSet`s.
+/// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
 pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>> {
     left: TDocSet,
     right: TDocSet,
@@ -91,7 +91,6 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
 }
 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
-    #[cfg_attr(feature = "cargo-clippy", allow(clippy::never_loop))]
     fn advance(&mut self) -> bool {
         let (left, right) = (&mut self.left, &mut self.right);
 

@@ -1,8 +1,9 @@
 use crate::core::META_FILEPATH;
 use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+use crate::directory::AntiCallToken;
 use crate::directory::WatchCallbackList;
-use crate::directory::WritePtr;
 use crate::directory::{Directory, ReadOnlySource, WatchCallback, WatchHandle};
+use crate::directory::{TerminatingWrite, WritePtr};
 use fail::fail_point;
 use std::collections::HashMap;
 use std::fmt;
@@ -68,6 +69,12 @@ impl Write for VecWriter {
         let mut fs = self.shared_directory.fs.write().unwrap();
         fs.write(self.path.clone(), self.data.get_ref());
         Ok(())
+    }
+}
+
+impl TerminatingWrite for VecWriter {
+    fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
+        self.flush()
     }
 }
 
@@ -137,6 +144,22 @@ impl RAMDirectory {
     pub fn total_mem_usage(&self) -> usize {
         self.fs.read().unwrap().total_mem_usage()
     }
+
+    /// Write a copy of all of the files saved in the RAMDirectory in the target `Directory`.
+    ///
+    /// Files are all written using the `Directory::write` meaning, even if they were
+    /// written using the `atomic_write` api.
+    ///
+    /// If an error is encounterred, files may be persisted partially.
+    pub fn persist(&self, dest: &mut dyn Directory) -> crate::Result<()> {
+        let wlock = self.fs.write().unwrap();
+        for (path, source) in wlock.fs.iter() {
+            let mut dest_wrt = dest.open_write(path)?;
+            dest_wrt.write_all(source.as_slice())?;
+            dest_wrt.terminate()?;
+        }
+        Ok(())
+    }
 }
 
 impl Directory for RAMDirectory {
@@ -145,6 +168,11 @@ impl Directory for RAMDirectory {
     }
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
+        fail_point!("RAMDirectory::delete", |_| {
+            use crate::directory::error::IOError;
+            let io_error = IOError::from(io::Error::from(io::ErrorKind::Other));
+            Err(DeleteError::from(io_error))
+        });
         self.fs.write().unwrap().delete(path)
     }
 
@@ -172,23 +200,48 @@ impl Directory for RAMDirectory {
     fn atomic_write(&mut self, path: &Path, data: &[u8]) -> io::Result<()> {
         fail_point!("RAMDirectory::atomic_write", |msg| Err(io::Error::new(
             io::ErrorKind::Other,
-            msg.unwrap_or("Undefined".to_string())
+            msg.unwrap_or_else(|| "Undefined".to_string())
         )));
         let path_buf = PathBuf::from(path);
 
         // Reserve the path to prevent calls to .write() to succeed.
         self.fs.write().unwrap().write(path_buf.clone(), &[]);
 
-        let mut vec_writer = VecWriter::new(path_buf.clone(), self.clone());
+        let mut vec_writer = VecWriter::new(path_buf, self.clone());
         vec_writer.write_all(data)?;
         vec_writer.flush()?;
         if path == Path::new(&*META_FILEPATH) {
-            self.fs.write().unwrap().watch_router.broadcast();
+            let _ = self.fs.write().unwrap().watch_router.broadcast();
         }
         Ok(())
     }
 
-    fn watch(&self, watch_callback: WatchCallback) -> WatchHandle {
-        self.fs.write().unwrap().watch(watch_callback)
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+        Ok(self.fs.write().unwrap().watch(watch_callback))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RAMDirectory;
+    use crate::Directory;
+    use std::io::Write;
+    use std::path::Path;
+
+    #[test]
+    fn test_persist() {
+        let msg_atomic: &'static [u8] = b"atomic is the way";
+        let msg_seq: &'static [u8] = b"sequential is the way";
+        let path_atomic: &'static Path = Path::new("atomic");
+        let path_seq: &'static Path = Path::new("seq");
+        let mut directory = RAMDirectory::create();
+        assert!(directory.atomic_write(path_atomic, msg_atomic).is_ok());
+        let mut wrt = directory.open_write(path_seq).unwrap();
+        assert!(wrt.write_all(msg_seq).is_ok());
+        assert!(wrt.flush().is_ok());
+        let mut directory_copy = RAMDirectory::create();
+        assert!(directory.persist(&mut directory_copy).is_ok());
+        assert_eq!(directory_copy.atomic_read(path_atomic).unwrap(), msg_atomic);
+        assert_eq!(directory_copy.atomic_read(path_seq).unwrap(), msg_seq);
     }
 }

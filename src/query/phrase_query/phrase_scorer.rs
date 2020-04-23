@@ -4,6 +4,7 @@ use crate::postings::Postings;
 use crate::query::bm25::BM25Weight;
 use crate::query::{Intersection, Scorer};
 use crate::DocId;
+use std::cmp::Ordering;
 
 struct PostingsWithOffset<TPostings> {
     offset: u32,
@@ -59,12 +60,16 @@ fn intersection_exists(left: &[u32], right: &[u32]) -> bool {
     while left_i < left.len() && right_i < right.len() {
         let left_val = left[left_i];
         let right_val = right[right_i];
-        if left_val < right_val {
-            left_i += 1;
-        } else if right_val < left_val {
-            right_i += 1;
-        } else {
-            return true;
+        match left_val.cmp(&right_val) {
+            Ordering::Less => {
+                left_i += 1;
+            }
+            Ordering::Equal => {
+                return true;
+            }
+            Ordering::Greater => {
+                right_i += 1;
+            }
         }
     }
     false
@@ -77,14 +82,18 @@ fn intersection_count(left: &[u32], right: &[u32]) -> usize {
     while left_i < left.len() && right_i < right.len() {
         let left_val = left[left_i];
         let right_val = right[right_i];
-        if left_val < right_val {
-            left_i += 1;
-        } else if right_val < left_val {
-            right_i += 1;
-        } else {
-            count += 1;
-            left_i += 1;
-            right_i += 1;
+        match left_val.cmp(&right_val) {
+            Ordering::Less => {
+                left_i += 1;
+            }
+            Ordering::Equal => {
+                count += 1;
+                left_i += 1;
+                right_i += 1;
+            }
+            Ordering::Greater => {
+                right_i += 1;
+            }
         }
     }
     count
@@ -103,15 +112,19 @@ fn intersection(left: &mut [u32], right: &[u32]) -> usize {
     while left_i < left_len && right_i < right_len {
         let left_val = left[left_i];
         let right_val = right[right_i];
-        if left_val < right_val {
-            left_i += 1;
-        } else if right_val < left_val {
-            right_i += 1;
-        } else {
-            left[count] = left_val;
-            count += 1;
-            left_i += 1;
-            right_i += 1;
+        match left_val.cmp(&right_val) {
+            Ordering::Less => {
+                left_i += 1;
+            }
+            Ordering::Equal => {
+                left[count] = left_val;
+                count += 1;
+                left_i += 1;
+                right_i += 1;
+            }
+            Ordering::Greater => {
+                right_i += 1;
+            }
         }
     }
     count
@@ -163,11 +176,9 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_exists(&mut self) -> bool {
-        {
-            self.intersection_docset
-                .docset_mut_specialized(0)
-                .positions(&mut self.left);
-        }
+        self.intersection_docset
+            .docset_mut_specialized(0)
+            .positions(&mut self.left);
         let mut intersection_len = self.left.len();
         for i in 1..self.num_terms - 1 {
             {

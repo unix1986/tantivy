@@ -1,9 +1,9 @@
-use super::segment::create_segment;
 use super::segment::Segment;
 use crate::core::Executor;
 use crate::core::IndexMeta;
 use crate::core::SegmentId;
 use crate::core::SegmentMeta;
+use crate::core::SegmentMetaInventory;
 use crate::core::META_FILEPATH;
 use crate::directory::ManagedDirectory;
 #[cfg(feature = "mmap")]
@@ -12,7 +12,6 @@ use crate::directory::INDEX_WRITER_LOCK;
 use crate::directory::{Directory, RAMDirectory};
 use crate::error::DataCorruption;
 use crate::error::TantivyError;
-use crate::indexer::index_writer::open_index_writer;
 use crate::indexer::index_writer::HEAP_SIZE_MIN;
 use crate::indexer::segment_updater::save_new_metas;
 use crate::reader::IndexReader;
@@ -20,22 +19,23 @@ use crate::reader::IndexReaderBuilder;
 use crate::schema::Field;
 use crate::schema::FieldType;
 use crate::schema::Schema;
-use crate::tokenizer::BoxedTokenizer;
-use crate::tokenizer::TokenizerManager;
+use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::IndexWriter;
-use crate::Result;
 use num_cpus;
-use serde_json;
 use std::borrow::BorrowMut;
+use std::collections::HashSet;
 use std::fmt;
 #[cfg(feature = "mmap")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn load_metas(directory: &dyn Directory) -> Result<IndexMeta> {
+fn load_metas(
+    directory: &dyn Directory,
+    inventory: &SegmentMetaInventory,
+) -> crate::Result<IndexMeta> {
     let meta_data = directory.atomic_read(&META_FILEPATH)?;
     let meta_string = String::from_utf8_lossy(&meta_data);
-    serde_json::from_str(&meta_string)
+    IndexMeta::deserialize(&meta_string, &inventory)
         .map_err(|e| {
             DataCorruption::new(
                 META_FILEPATH.to_path_buf(),
@@ -52,6 +52,7 @@ pub struct Index {
     schema: Schema,
     executor: Arc<Executor>,
     tokenizers: TokenizerManager,
+    inventory: SegmentMetaInventory,
 }
 
 impl Index {
@@ -72,15 +73,16 @@ impl Index {
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with a given number of threads.
-    pub fn set_multithread_executor(&mut self, num_threads: usize) {
-        self.executor = Arc::new(Executor::multi_thread(num_threads, "thrd-tantivy-search-"));
+    pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
+        self.executor = Arc::new(Executor::multi_thread(num_threads, "thrd-tantivy-search-")?);
+        Ok(())
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with a given number of threads.
-    pub fn set_default_multithread_executor(&mut self) {
+    pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
         let default_num_threads = num_cpus::get();
-        self.set_multithread_executor(default_num_threads);
+        self.set_multithread_executor(default_num_threads)
     }
 
     /// Creates a new index using the `RAMDirectory`.
@@ -97,28 +99,29 @@ impl Index {
     ///
     /// If a previous index was in this directory, then its meta file will be destroyed.
     #[cfg(feature = "mmap")]
-    pub fn create_in_dir<P: AsRef<Path>>(directory_path: P, schema: Schema) -> Result<Index> {
+    pub fn create_in_dir<P: AsRef<Path>>(
+        directory_path: P,
+        schema: Schema,
+    ) -> crate::Result<Index> {
         let mmap_directory = MmapDirectory::open(directory_path)?;
         if Index::exists(&mmap_directory) {
             return Err(TantivyError::IndexAlreadyExists);
         }
-
         Index::create(mmap_directory, schema)
     }
 
     /// Opens or creates a new index in the provided directory
-    pub fn open_or_create<Dir: Directory>(dir: Dir, schema: Schema) -> Result<Index> {
-        if Index::exists(&dir) {
-            let index = Index::open(dir)?;
-            if index.schema() == schema {
-                Ok(index)
-            } else {
-                Err(TantivyError::SchemaError(
-                    "An index exists but the schema does not match.".to_string(),
-                ))
-            }
+    pub fn open_or_create<Dir: Directory>(dir: Dir, schema: Schema) -> crate::Result<Index> {
+        if !Index::exists(&dir) {
+            return Index::create(dir, schema);
+        }
+        let index = Index::open(dir)?;
+        if index.schema() == schema {
+            Ok(index)
         } else {
-            Index::create(dir, schema)
+            Err(TantivyError::SchemaError(
+                "An index exists but the schema does not match.".to_string(),
+            ))
         }
     }
 
@@ -131,13 +134,13 @@ impl Index {
     /// The temp directory is only used for testing the `MmapDirectory`.
     /// For other unit tests, prefer the `RAMDirectory`, see: `create_in_ram`.
     #[cfg(feature = "mmap")]
-    pub fn create_from_tempdir(schema: Schema) -> Result<Index> {
+    pub fn create_from_tempdir(schema: Schema) -> crate::Result<Index> {
         let mmap_directory = MmapDirectory::create_from_tempdir()?;
         Index::create(mmap_directory, schema)
     }
 
     /// Creates a new index given an implementation of the trait `Directory`
-    pub fn create<Dir: Directory>(dir: Dir, schema: Schema) -> Result<Index> {
+    pub fn create<Dir: Directory>(dir: Dir, schema: Schema) -> crate::Result<Index> {
         let directory = ManagedDirectory::wrap(dir)?;
         Index::from_directory(directory, schema)
     }
@@ -145,22 +148,26 @@ impl Index {
     /// Create a new index from a directory.
     ///
     /// This will overwrite existing meta.json
-    fn from_directory(mut directory: ManagedDirectory, schema: Schema) -> Result<Index> {
+    fn from_directory(mut directory: ManagedDirectory, schema: Schema) -> crate::Result<Index> {
         save_new_metas(schema.clone(), directory.borrow_mut())?;
         let metas = IndexMeta::with_schema(schema);
-        Index::create_from_metas(directory, &metas)
+        Index::create_from_metas(directory, &metas, SegmentMetaInventory::default())
     }
 
     /// Creates a new index given a directory and an `IndexMeta`.
-    fn create_from_metas(directory: ManagedDirectory, metas: &IndexMeta) -> Result<Index> {
+    fn create_from_metas(
+        directory: ManagedDirectory,
+        metas: &IndexMeta,
+        inventory: SegmentMetaInventory,
+    ) -> crate::Result<Index> {
         let schema = metas.schema.clone();
-        let index = Index {
+        Ok(Index {
             directory,
             schema,
             tokenizers: TokenizerManager::default(),
             executor: Arc::new(Executor::single_thread()),
-        };
-        Ok(index)
+            inventory,
+        })
     }
 
     /// Accessor for the tokenizer manager.
@@ -169,11 +176,11 @@ impl Index {
     }
 
     /// Helper to access the tokenizer associated to a specific field.
-    pub fn tokenizer_for_field(&self, field: Field) -> Result<Box<dyn BoxedTokenizer>> {
+    pub fn tokenizer_for_field(&self, field: Field) -> crate::Result<TextAnalyzer> {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let tokenizer_manager: &TokenizerManager = self.tokenizers();
-        let tokenizer_name_opt: Option<Box<dyn BoxedTokenizer>> = match field_type {
+        let tokenizer_name_opt: Option<TextAnalyzer> = match field_type {
             FieldType::Str(text_options) => text_options
                 .get_indexing_options()
                 .map(|text_indexing_options| text_indexing_options.tokenizer().to_string())
@@ -192,7 +199,7 @@ impl Index {
     /// Create a default `IndexReader` for the given index.
     ///
     /// See [`Index.reader_builder()`](#method.reader_builder).
-    pub fn reader(&self) -> Result<IndexReader> {
+    pub fn reader(&self) -> crate::Result<IndexReader> {
         self.reader_builder().try_into()
     }
 
@@ -207,21 +214,40 @@ impl Index {
 
     /// Opens a new directory from an index path.
     #[cfg(feature = "mmap")]
-    pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> Result<Index> {
+    pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
         let mmap_directory = MmapDirectory::open(directory_path)?;
         Index::open(mmap_directory)
     }
 
+    /// Returns the list of the segment metas tracked by the index.
+    ///
+    /// Such segments can of course be part of the index,
+    /// but also they could be segments being currently built or in the middle of a merge
+    /// operation.
+    pub fn list_all_segment_metas(&self) -> Vec<SegmentMeta> {
+        self.inventory.all()
+    }
+
+    /// Creates a new segment_meta (Advanced user only).
+    ///
+    /// As long as the `SegmentMeta` lives, the files associated with the
+    /// `SegmentMeta` are guaranteed to not be garbage collected, regardless of
+    /// whether the segment is recorded as part of the index or not.
+    pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
+        self.inventory.new_segment_meta(segment_id, max_doc)
+    }
+
     /// Open the index using the provided directory
-    pub fn open<D: Directory>(directory: D) -> Result<Index> {
+    pub fn open<D: Directory>(directory: D) -> crate::Result<Index> {
         let directory = ManagedDirectory::wrap(directory)?;
-        let metas = load_metas(&directory)?;
-        Index::create_from_metas(directory, &metas)
+        let inventory = SegmentMetaInventory::default();
+        let metas = load_metas(&directory, &inventory)?;
+        Index::create_from_metas(directory, &metas, inventory)
     }
 
     /// Reads the index meta file from the directory.
-    pub fn load_metas(&self) -> Result<IndexMeta> {
-        load_metas(self.directory())
+    pub fn load_metas(&self) -> crate::Result<IndexMeta> {
+        load_metas(self.directory(), &self.inventory)
     }
 
     /// Open a new index writer. Attempts to acquire a lockfile.
@@ -248,7 +274,7 @@ impl Index {
         &self,
         num_threads: usize,
         overall_heap_size_in_bytes: usize,
-    ) -> Result<IndexWriter> {
+    ) -> crate::Result<IndexWriter> {
         let directory_lock = self
             .directory
             .acquire_lock(&INDEX_WRITER_LOCK)
@@ -265,7 +291,7 @@ impl Index {
                 )
             })?;
         let heap_size_in_bytes_per_thread = overall_heap_size_in_bytes / num_threads;
-        open_index_writer(
+        IndexWriter::new(
             self,
             num_threads,
             heap_size_in_bytes_per_thread,
@@ -283,7 +309,7 @@ impl Index {
     /// If the lockfile already exists, returns `Error::FileAlreadyExists`.
     /// # Panics
     /// If the heap size per thread is too small, panics.
-    pub fn writer(&self, overall_heap_size_in_bytes: usize) -> Result<IndexWriter> {
+    pub fn writer(&self, overall_heap_size_in_bytes: usize) -> crate::Result<IndexWriter> {
         let mut num_threads = num_cpus::get();
         let heap_size_in_bytes_per_thread = overall_heap_size_in_bytes / num_threads;
         if heap_size_in_bytes_per_thread < HEAP_SIZE_MIN {
@@ -300,7 +326,7 @@ impl Index {
     }
 
     /// Returns the list of segments that are searchable
-    pub fn searchable_segments(&self) -> Result<Vec<Segment>> {
+    pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
         Ok(self
             .searchable_segment_metas()?
             .into_iter()
@@ -310,12 +336,14 @@ impl Index {
 
     #[doc(hidden)]
     pub fn segment(&self, segment_meta: SegmentMeta) -> Segment {
-        create_segment(self.clone(), segment_meta)
+        Segment::for_index(self.clone(), segment_meta)
     }
 
     /// Creates a new segment.
     pub fn new_segment(&self) -> Segment {
-        let segment_meta = SegmentMeta::new(SegmentId::generate_random(), 0);
+        let segment_meta = self
+            .inventory
+            .new_segment_meta(SegmentId::generate_random(), 0);
         self.segment(segment_meta)
     }
 
@@ -331,17 +359,22 @@ impl Index {
 
     /// Reads the meta.json and returns the list of
     /// `SegmentMeta` from the last commit.
-    pub fn searchable_segment_metas(&self) -> Result<Vec<SegmentMeta>> {
+    pub fn searchable_segment_metas(&self) -> crate::Result<Vec<SegmentMeta>> {
         Ok(self.load_metas()?.segments)
     }
 
     /// Returns the list of segment ids that are searchable.
-    pub fn searchable_segment_ids(&self) -> Result<Vec<SegmentId>> {
+    pub fn searchable_segment_ids(&self) -> crate::Result<Vec<SegmentId>> {
         Ok(self
             .searchable_segment_metas()?
             .iter()
             .map(SegmentMeta::id)
             .collect())
+    }
+
+    /// Returns the set of corrupted files
+    pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
+        self.directory.list_damaged().map_err(Into::into)
     }
 }
 
@@ -356,12 +389,9 @@ mod tests {
     use crate::directory::RAMDirectory;
     use crate::schema::Field;
     use crate::schema::{Schema, INDEXED, TEXT};
-    use crate::Index;
     use crate::IndexReader;
-    use crate::IndexWriter;
     use crate::ReloadPolicy;
-    use std::thread;
-    use std::time::Duration;
+    use crate::{Directory, Index};
 
     #[test]
     fn test_indexer_for_field() {
@@ -439,40 +469,38 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(reader.searcher().num_docs(), 0);
-        let mut writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-        test_index_on_commit_reload_policy_aux(field, &mut writer, &reader);
+        test_index_on_commit_reload_policy_aux(field, &index, &reader);
     }
 
     #[cfg(feature = "mmap")]
     mod mmap_specific {
 
         use super::*;
+        use crate::Directory;
         use std::path::PathBuf;
-        use tempdir::TempDir;
+        use tempfile::TempDir;
 
         #[test]
         fn test_index_on_commit_reload_policy_mmap() {
             let schema = throw_away_schema();
             let field = schema.get_field("num_likes").unwrap();
-            let tempdir = TempDir::new("index").unwrap();
+            let tempdir = TempDir::new().unwrap();
             let tempdir_path = PathBuf::from(tempdir.path());
             let index = Index::create_in_dir(&tempdir_path, schema).unwrap();
-            let mut writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-            writer.commit().unwrap();
             let reader = index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::OnCommit)
                 .try_into()
                 .unwrap();
             assert_eq!(reader.searcher().num_docs(), 0);
-            test_index_on_commit_reload_policy_aux(field, &mut writer, &reader);
+            test_index_on_commit_reload_policy_aux(field, &index, &reader);
         }
 
         #[test]
         fn test_index_manual_policy_mmap() {
             let schema = throw_away_schema();
             let field = schema.get_field("num_likes").unwrap();
-            let index = Index::create_from_tempdir(schema).unwrap();
+            let mut index = Index::create_from_tempdir(schema).unwrap();
             let mut writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
             writer.commit().unwrap();
             let reader = index
@@ -482,8 +510,12 @@ mod tests {
                 .unwrap();
             assert_eq!(reader.searcher().num_docs(), 0);
             writer.add_document(doc!(field=>1u64));
+            let (sender, receiver) = crossbeam::channel::unbounded();
+            let _handle = index.directory_mut().watch(Box::new(move || {
+                let _ = sender.send(());
+            }));
             writer.commit().unwrap();
-            thread::sleep(Duration::from_millis(500));
+            assert!(receiver.recv().is_ok());
             assert_eq!(reader.searcher().num_docs(), 0);
             reader.reload().unwrap();
             assert_eq!(reader.searcher().num_docs(), 1);
@@ -493,7 +525,7 @@ mod tests {
         fn test_index_on_commit_reload_policy_different_directories() {
             let schema = throw_away_schema();
             let field = schema.get_field("num_likes").unwrap();
-            let tempdir = TempDir::new("index").unwrap();
+            let tempdir = TempDir::new().unwrap();
             let tempdir_path = PathBuf::from(tempdir.path());
             let write_index = Index::create_in_dir(&tempdir_path, schema).unwrap();
             let read_index = Index::open_in_dir(&tempdir_path).unwrap();
@@ -503,39 +535,26 @@ mod tests {
                 .try_into()
                 .unwrap();
             assert_eq!(reader.searcher().num_docs(), 0);
-            let mut writer = write_index.writer_with_num_threads(1, 3_000_000).unwrap();
-            test_index_on_commit_reload_policy_aux(field, &mut writer, &reader);
+            test_index_on_commit_reload_policy_aux(field, &write_index, &reader);
         }
     }
 
-    fn test_index_on_commit_reload_policy_aux(
-        field: Field,
-        writer: &mut IndexWriter,
-        reader: &IndexReader,
-    ) {
+    fn test_index_on_commit_reload_policy_aux(field: Field, index: &Index, reader: &IndexReader) {
+        let mut reader_index = reader.index();
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let _watch_handle = reader_index.directory_mut().watch(Box::new(move || {
+            let _ = sender.send(());
+        }));
+        let mut writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
         assert_eq!(reader.searcher().num_docs(), 0);
         writer.add_document(doc!(field=>1u64));
         writer.commit().unwrap();
-        let mut count = 0;
-        for _ in 0..100 {
-            count = reader.searcher().num_docs();
-            if count > 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert_eq!(count, 1);
+        assert!(receiver.recv().is_ok());
+        assert_eq!(reader.searcher().num_docs(), 1);
         writer.add_document(doc!(field=>2u64));
         writer.commit().unwrap();
-        let mut count = 0;
-        for _ in 0..10 {
-            count = reader.searcher().num_docs();
-            if count > 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert_eq!(count, 2);
+        assert!(receiver.recv().is_ok());
+        assert_eq!(reader.searcher().num_docs(), 2);
     }
 
     // This test will not pass on windows, because windows
@@ -552,9 +571,13 @@ mod tests {
         for i in 0u64..8_000u64 {
             writer.add_document(doc!(field => i));
         }
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let _handle = directory.watch(Box::new(move || {
+            let _ = sender.send(());
+        }));
         writer.commit().unwrap();
         let mem_right_after_commit = directory.total_mem_usage();
-        thread::sleep(Duration::from_millis(1_000));
+        assert!(receiver.recv().is_ok());
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -568,7 +591,11 @@ mod tests {
         reader.reload().unwrap();
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 8_000);
-        assert!(mem_right_after_merge_finished < mem_right_after_commit);
+        assert!(
+            mem_right_after_merge_finished < mem_right_after_commit,
+            "(mem after merge){} is expected < (mem before merge){}",
+            mem_right_after_merge_finished,
+            mem_right_after_commit
+        );
     }
-
 }

@@ -25,14 +25,11 @@
 
 // ---
 // Importing tantivy...
-#[macro_use]
-extern crate tantivy;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use tantivy::schema::{Schema, STORED, TEXT};
-use tantivy::Opstamp;
-use tantivy::{Index, IndexWriter};
+use tantivy::{doc, Index, IndexWriter, Opstamp};
 
 fn main() -> tantivy::Result<()> {
     // # Defining the schema
@@ -49,10 +46,9 @@ fn main() -> tantivy::Result<()> {
     thread::spawn(move || {
         // we index 100 times the document... for the sake of the example.
         for i in 0..100 {
-            let opstamp = {
-                // A read lock is sufficient here.
-                let index_writer_rlock = index_writer_clone_1.read().unwrap();
-                index_writer_rlock.add_document(
+            let opstamp = index_writer_clone_1
+                .read().unwrap() //< A read lock is sufficient here.
+                .add_document(
                     doc!(
                         title => "Of Mice and Men",
                         body => "A few miles south of Soledad, the Salinas River drops in close to the hillside \
@@ -63,8 +59,7 @@ fn main() -> tantivy::Result<()> {
                         fresh and green with every spring, carrying in their lower leaf junctures the \
                         debris of the winter’s flooding; and sycamores with mottled, white, recumbent \
                         limbs and branches that arch over the pool"
-                    ))
-            };
+                    ));
             println!("add doc {} from thread 1 - opstamp {}", i, opstamp);
             thread::sleep(Duration::from_millis(20));
         }

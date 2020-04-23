@@ -2,7 +2,7 @@ use crate::common::BinarySerializable;
 use crate::common::CountingWriter;
 use crate::common::VInt;
 use crate::directory::ReadOnlySource;
-use crate::directory::WritePtr;
+use crate::directory::{TerminatingWrite, WritePtr};
 use crate::schema::Field;
 use crate::space_usage::FieldUsage;
 use crate::space_usage::PerFieldSpaceUsage;
@@ -42,7 +42,7 @@ pub struct CompositeWrite<W = WritePtr> {
     offsets: HashMap<FileAddr, u64>,
 }
 
-impl<W: Write> CompositeWrite<W> {
+impl<W: TerminatingWrite + Write> CompositeWrite<W> {
     /// Crate a new API writer that writes a composite file
     /// in a given write.
     pub fn wrap(w: W) -> CompositeWrite<W> {
@@ -91,8 +91,7 @@ impl<W: Write> CompositeWrite<W> {
 
         let footer_len = (self.write.written_bytes() - footer_offset) as u32;
         footer_len.serialize(&mut self.write)?;
-        self.write.flush()?;
-        Ok(())
+        self.write.terminate()
     }
 }
 
@@ -200,13 +199,13 @@ mod test {
             let w = directory.open_write(path).unwrap();
             let mut composite_write = CompositeWrite::wrap(w);
             {
-                let mut write_0 = composite_write.for_field(Field(0u32));
+                let mut write_0 = composite_write.for_field(Field::from_field_id(0u32));
                 VInt(32431123u64).serialize(&mut write_0).unwrap();
                 write_0.flush().unwrap();
             }
 
             {
-                let mut write_4 = composite_write.for_field(Field(4u32));
+                let mut write_4 = composite_write.for_field(Field::from_field_id(4u32));
                 VInt(2).serialize(&mut write_4).unwrap();
                 write_4.flush().unwrap();
             }
@@ -216,14 +215,18 @@ mod test {
             let r = directory.open_read(path).unwrap();
             let composite_file = CompositeFile::open(&r).unwrap();
             {
-                let file0 = composite_file.open_read(Field(0u32)).unwrap();
+                let file0 = composite_file
+                    .open_read(Field::from_field_id(0u32))
+                    .unwrap();
                 let mut file0_buf = file0.as_slice();
                 let payload_0 = VInt::deserialize(&mut file0_buf).unwrap().0;
                 assert_eq!(file0_buf.len(), 0);
                 assert_eq!(payload_0, 32431123u64);
             }
             {
-                let file4 = composite_file.open_read(Field(4u32)).unwrap();
+                let file4 = composite_file
+                    .open_read(Field::from_field_id(4u32))
+                    .unwrap();
                 let mut file4_buf = file4.as_slice();
                 let payload_4 = VInt::deserialize(&mut file4_buf).unwrap().0;
                 assert_eq!(file4_buf.len(), 0);
@@ -231,5 +234,4 @@ mod test {
             }
         }
     }
-
 }

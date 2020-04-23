@@ -2,7 +2,6 @@ use super::Collector;
 use super::SegmentCollector;
 use crate::collector::Fruit;
 use crate::DocId;
-use crate::Result;
 use crate::Score;
 use crate::SegmentLocalId;
 use crate::SegmentReader;
@@ -24,7 +23,7 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
         &self,
         segment_local_id: u32,
         reader: &SegmentReader,
-    ) -> Result<Box<dyn BoxableSegmentCollector>> {
+    ) -> crate::Result<Box<dyn BoxableSegmentCollector>> {
         let child = self.0.for_segment(segment_local_id, reader)?;
         Ok(Box::new(SegmentCollectorWrapper(child)))
     }
@@ -33,7 +32,10 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
         self.0.requires_scoring()
     }
 
-    fn merge_fruits(&self, children: Vec<<Self as Collector>::Fruit>) -> Result<Box<dyn Fruit>> {
+    fn merge_fruits(
+        &self,
+        children: Vec<<Self as Collector>::Fruit>,
+    ) -> crate::Result<Box<dyn Fruit>> {
         let typed_fruit: Vec<TCollector::Fruit> = children
             .into_iter()
             .map(|untyped_fruit| {
@@ -44,7 +46,7 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
                         TantivyError::InvalidArgument("Failed to cast child fruit.".to_string())
                     })
             })
-            .collect::<Result<_>>()?;
+            .collect::<crate::Result<_>>()?;
         let merged_fruit = self.0.merge_fruits(typed_fruit)?;
         Ok(Box::new(merged_fruit))
     }
@@ -105,54 +107,38 @@ impl<TFruit: Fruit> FruitHandle<TFruit> {
 /// [Combining several collectors section of the collector documentation](./index.html#combining-several-collectors).
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate tantivy;
-/// use tantivy::schema::{Schema, TEXT};
-/// use tantivy::{Index, Result};
 /// use tantivy::collector::{Count, TopDocs, MultiCollector};
 /// use tantivy::query::QueryParser;
+/// use tantivy::schema::{Schema, TEXT};
+/// use tantivy::{doc, Index};
 ///
-/// # fn main() { example().unwrap(); }
-/// fn example() -> Result<()> {
-///     let mut schema_builder = Schema::builder();
-///     let title = schema_builder.add_text_field("title", TEXT);
-///     let schema = schema_builder.build();
-///     let index = Index::create_in_ram(schema);
-///     {
-///         let mut index_writer = index.writer(3_000_000)?;
-///         index_writer.add_document(doc!(
-///             title => "The Name of the Wind",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of Muadib",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "A Dairy Cow",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of a Young Girl",
-///         ));
-///         index_writer.commit().unwrap();
-///     }
+/// let mut schema_builder = Schema::builder();
+/// let title = schema_builder.add_text_field("title", TEXT);
+/// let schema = schema_builder.build();
+/// let index = Index::create_in_ram(schema);
 ///
-///     let reader = index.reader()?;
-///     let searcher = reader.searcher();
+/// let mut index_writer = index.writer(3_000_000).unwrap();
+/// index_writer.add_document(doc!(title => "The Name of the Wind"));
+/// index_writer.add_document(doc!(title => "The Diary of Muadib"));
+/// index_writer.add_document(doc!(title => "A Dairy Cow"));
+/// index_writer.add_document(doc!(title => "The Diary of a Young Girl"));
+/// assert!(index_writer.commit().is_ok());
 ///
-///     let mut collectors = MultiCollector::new();
-///     let top_docs_handle = collectors.add_collector(TopDocs::with_limit(2));
-///     let count_handle = collectors.add_collector(Count);
-///     let query_parser = QueryParser::for_index(&index, vec![title]);
-///     let query = query_parser.parse_query("diary")?;
-///     let mut multi_fruit = searcher.search(&query, &collectors)?;
+/// let reader = index.reader().unwrap();
+/// let searcher = reader.searcher();
 ///
-///     let count = count_handle.extract(&mut multi_fruit);
-///     let top_docs = top_docs_handle.extract(&mut multi_fruit);
+/// let mut collectors = MultiCollector::new();
+/// let top_docs_handle = collectors.add_collector(TopDocs::with_limit(2));
+/// let count_handle = collectors.add_collector(Count);
+/// let query_parser = QueryParser::for_index(&index, vec![title]);
+/// let query = query_parser.parse_query("diary").unwrap();
+/// let mut multi_fruit = searcher.search(&query, &collectors).unwrap();
 ///
-///     # assert_eq!(count, 2);
-///     # assert_eq!(top_docs.len(), 2);
+/// let count = count_handle.extract(&mut multi_fruit);
+/// let top_docs = top_docs_handle.extract(&mut multi_fruit);
 ///
-///     Ok(())
-/// }
+/// assert_eq!(count, 2);
+/// assert_eq!(top_docs.len(), 2);
 /// ```
 #[allow(clippy::type_complexity)]
 #[derive(Default)]
@@ -191,12 +177,12 @@ impl<'a> Collector for MultiCollector<'a> {
         &self,
         segment_local_id: SegmentLocalId,
         segment: &SegmentReader,
-    ) -> Result<MultiCollectorChild> {
+    ) -> crate::Result<MultiCollectorChild> {
         let children = self
             .collector_wrappers
             .iter()
             .map(|collector_wrapper| collector_wrapper.for_segment(segment_local_id, segment))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?;
         Ok(MultiCollectorChild { children })
     }
 
@@ -207,7 +193,7 @@ impl<'a> Collector for MultiCollector<'a> {
             .any(Collector::requires_scoring)
     }
 
-    fn merge_fruits(&self, segments_multifruits: Vec<MultiFruit>) -> Result<MultiFruit> {
+    fn merge_fruits(&self, segments_multifruits: Vec<MultiFruit>) -> crate::Result<MultiFruit> {
         let mut segment_fruits_list: Vec<Vec<Box<dyn Fruit>>> = (0..self.collector_wrappers.len())
             .map(|_| Vec::with_capacity(segments_multifruits.len()))
             .collect::<Vec<_>>();
@@ -225,7 +211,7 @@ impl<'a> Collector for MultiCollector<'a> {
             .map(|(child_collector, segment_fruits)| {
                 Ok(Some(child_collector.merge_fruits(segment_fruits)?))
             })
-            .collect::<Result<_>>()?;
+            .collect::<crate::Result<_>>()?;
         Ok(MultiFruit { sub_fruits })
     }
 }

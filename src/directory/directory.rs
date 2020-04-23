@@ -48,14 +48,14 @@ impl RetryPolicy {
 ///
 /// It is transparently associated to a lock file, that gets deleted
 /// on `Drop.` The lock is released automatically on `Drop`.
-pub struct DirectoryLock(Box<dyn Drop + Send + Sync + 'static>);
+pub struct DirectoryLock(Box<dyn Send + Sync + 'static>);
 
 struct DirectoryLockGuard {
     directory: Box<dyn Directory>,
     path: PathBuf,
 }
 
-impl<T: Drop + Send + Sync + 'static> From<Box<T>> for DirectoryLock {
+impl<T: Send + Sync + 'static> From<Box<T>> for DirectoryLock {
     fn from(underlying: Box<T>) -> Self {
         DirectoryLock(underlying)
     }
@@ -118,6 +118,8 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     ///
     /// Specifically, subsequent writes or flushes should
     /// have no effect on the returned `ReadOnlySource` object.
+    ///
+    /// You should only use this to read files create with [Directory::open_write].
     fn open_read(&self, path: &Path) -> result::Result<ReadOnlySource, OpenReadError>;
 
     /// Removes a file
@@ -157,6 +159,8 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// atomic_write.
     ///
     /// This should only be used for small files.
+    ///
+    /// You should only use this to read files create with [Directory::atomic_write].
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError>;
 
     /// Atomically replace the content of a file with data.
@@ -193,7 +197,7 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Registers a callback that will be called whenever a change on the `meta.json`
     /// using the `atomic_write` API is detected.
     ///
-    /// The behavior when using `.watch()` on a file using `.open_write(...)` is, on the other
+    /// The behavior when using `.watch()` on a file using [Directory::open_write] is, on the other
     /// hand, undefined.
     ///
     /// The file will be watched for the lifetime of the returned `WatchHandle`. The caller is
@@ -204,7 +208,7 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Internally, tantivy only uses this API to detect new commits to implement the
     /// `OnCommit` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents the
     /// `OnCommit` `ReloadPolicy` to work properly.
-    fn watch(&self, watch_callback: WatchCallback) -> WatchHandle;
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
 }
 
 /// DirectoryClone

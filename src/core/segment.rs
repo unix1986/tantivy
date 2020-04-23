@@ -8,10 +8,8 @@ use crate::directory::{ReadOnlySource, WritePtr};
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::schema::Schema;
 use crate::Opstamp;
-use crate::Result;
 use std::fmt;
 use std::path::PathBuf;
-use std::result;
 
 /// A segment is a piece of the index.
 #[derive(Clone)]
@@ -26,15 +24,12 @@ impl fmt::Debug for Segment {
     }
 }
 
-/// Creates a new segment given an `Index` and a `SegmentId`
-///
-/// The function is here to make it private outside `tantivy`.
-/// #[doc(hidden)]
-pub fn create_segment(index: Index, meta: SegmentMeta) -> Segment {
-    Segment { index, meta }
-}
-
 impl Segment {
+    /// Creates a new segment given an `Index` and a `SegmentId`
+    pub(crate) fn for_index(index: Index, meta: SegmentMeta) -> Segment {
+        Segment { index, meta }
+    }
+
     /// Returns the index the segment belongs to.
     pub fn index(&self) -> &Index {
         &self.index
@@ -48,6 +43,17 @@ impl Segment {
     /// Returns the segment meta-information
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
+    }
+
+    /// Updates the max_doc value from the `SegmentMeta`.
+    ///
+    /// This method is only used when updating `max_doc` from 0
+    /// as we finalize a fresh new segment.
+    pub(crate) fn with_max_doc(self, max_doc: u32) -> Segment {
+        Segment {
+            index: self.index,
+            meta: self.meta.with_max_doc(max_doc),
+        }
     }
 
     #[doc(hidden)]
@@ -72,20 +78,14 @@ impl Segment {
     }
 
     /// Open one of the component file for a *regular* read.
-    pub fn open_read(
-        &self,
-        component: SegmentComponent,
-    ) -> result::Result<ReadOnlySource, OpenReadError> {
+    pub fn open_read(&self, component: SegmentComponent) -> Result<ReadOnlySource, OpenReadError> {
         let path = self.relative_path(component);
         let source = self.index.directory().open_read(&path)?;
         Ok(source)
     }
 
     /// Open one of the component file for *regular* write.
-    pub fn open_write(
-        &mut self,
-        component: SegmentComponent,
-    ) -> result::Result<WritePtr, OpenWriteError> {
+    pub fn open_write(&mut self, component: SegmentComponent) -> Result<WritePtr, OpenWriteError> {
         let path = self.relative_path(component);
         let write = self.index.directory_mut().open_write(&path)?;
         Ok(write)
@@ -98,5 +98,5 @@ pub trait SerializableSegment {
     ///
     /// # Returns
     /// The number of documents in the segment.
-    fn write(&self, serializer: SegmentSerializer) -> Result<u32>;
+    fn write(&self, serializer: SegmentSerializer) -> crate::Result<u32>;
 }

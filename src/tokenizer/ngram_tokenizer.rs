@@ -1,4 +1,5 @@
 use super::{Token, TokenStream, Tokenizer};
+use crate::tokenizer::BoxTokenStream;
 
 /// Tokenize the text by splitting words into n-grams of the given size(s)
 ///
@@ -29,10 +30,9 @@ use super::{Token, TokenStream, Tokenizer};
 ///
 /// # Example
 ///
-/// ```
-/// # extern crate tantivy;
+/// ```rust
 /// use tantivy::tokenizer::*;
-/// # fn main() {
+///
 /// let tokenizer = NgramTokenizer::new(2, 3, false);
 /// let mut stream = tokenizer.token_stream("hello");
 /// {
@@ -78,7 +78,6 @@ use super::{Token, TokenStream, Tokenizer};
 ///   assert_eq!(token.offset_to, 5);
 /// }
 /// assert!(stream.next().is_none());
-/// # }
 /// ```
 #[derive(Clone)]
 pub struct NgramTokenizer {
@@ -131,11 +130,9 @@ pub struct NgramTokenStream<'a> {
     token: Token,
 }
 
-impl<'a> Tokenizer<'a> for NgramTokenizer {
-    type TokenStreamImpl = NgramTokenStream<'a>;
-
-    fn token_stream(&self, text: &'a str) -> Self::TokenStreamImpl {
-        NgramTokenStream {
+impl Tokenizer for NgramTokenizer {
+    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
+        From::from(NgramTokenStream {
             ngram_charidx_iterator: StutteringIterator::new(
                 CodepointFrontiers::for_str(text),
                 self.min_gram,
@@ -144,7 +141,7 @@ impl<'a> Tokenizer<'a> for NgramTokenizer {
             prefix_only: self.prefix_only,
             text,
             token: Token::default(),
-        }
+        })
     }
 }
 
@@ -310,10 +307,10 @@ mod tests {
     use super::NgramTokenizer;
     use super::StutteringIterator;
     use crate::tokenizer::tests::assert_token;
-    use crate::tokenizer::tokenizer::{TokenStream, Tokenizer};
-    use crate::tokenizer::Token;
+    use crate::tokenizer::tokenizer::Tokenizer;
+    use crate::tokenizer::{BoxTokenStream, Token};
 
-    fn test_helper<T: TokenStream>(mut tokenizer: T) -> Vec<Token> {
+    fn test_helper(mut tokenizer: BoxTokenStream) -> Vec<Token> {
         let mut tokens: Vec<Token> = vec![];
         tokenizer.process(&mut |token: &Token| tokens.push(token.clone()));
         tokens
@@ -461,5 +458,4 @@ mod tests {
         assert_eq!(it.next(), Some((8, 9)));
         assert_eq!(it.next(), None);
     }
-
 }

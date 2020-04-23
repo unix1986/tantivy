@@ -1,18 +1,16 @@
-/*!
-Query
-*/
+/*! Query Module */
 
 mod all_query;
 mod automaton_weight;
 mod bitset;
 mod bm25;
 mod boolean_query;
+mod boost_query;
 mod empty_query;
 mod exclude;
 mod explanation;
 mod fuzzy_query;
 mod intersection;
-mod occur;
 mod phrase_query;
 mod query;
 mod query_parser;
@@ -38,12 +36,14 @@ pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
 pub use self::bitset::BitSetDocSet;
 pub use self::boolean_query::BooleanQuery;
+pub use self::boost_query::BoostQuery;
 pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};
 pub use self::exclude::Exclude;
 pub use self::explanation::Explanation;
+#[cfg(test)]
+pub(crate) use self::fuzzy_query::DFAWrapper;
 pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::intersect_scorers;
-pub use self::occur::Occur;
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::Query;
 pub use self::query_parser::QueryParser;
@@ -55,6 +55,7 @@ pub use self::scorer::ConstScorer;
 pub use self::scorer::Scorer;
 pub use self::term_query::TermQuery;
 pub use self::weight::Weight;
+pub use tantivy_query_grammar::Occur;
 
 #[cfg(test)]
 mod tests {

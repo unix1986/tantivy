@@ -44,7 +44,7 @@ We can split the problem of generating a search result page into two phases :
   the search results page. (`doc_ids[] -> Document[]`)
 
 In the first phase, the ability to search for documents by the given field is determined by the
-[`TextIndexingOptions`](enum.TextIndexingOptions.html) of our
+[`IndexRecordOption`](enum.IndexRecordOption.html) of our
 [`TextOptions`](struct.TextOptions.html).
 
 The effect of each possible setting is described more in detail
@@ -54,7 +54,7 @@ On the other hand setting the field as stored or not determines whether the fiel
 when [`searcher.doc(doc_address)`](../struct.Searcher.html#method.doc) is called.
 
 
-## Setting a u64 or a i64 field
+## Setting a u64, a i64 or a f64 field
 
 ### Example
 
@@ -174,5 +174,4 @@ mod tests {
         assert!(!is_valid_field_name("シャボン玉"));
         assert!(is_valid_field_name("my_text_field"));
     }
-
 }

@@ -3,10 +3,10 @@ use crate::query::bm25::BM25Weight;
 use crate::query::Query;
 use crate::query::Weight;
 use crate::schema::IndexRecordOption;
-use crate::Result;
 use crate::Searcher;
 use crate::Term;
 use std::collections::BTreeSet;
+use std::fmt;
 
 /// A Term query matches all of the documents
 /// containing a specific term.
@@ -19,52 +19,53 @@ use std::collections::BTreeSet;
 /// * `field norm` - number of tokens in the field.
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate tantivy;
-/// use tantivy::schema::{Schema, TEXT, IndexRecordOption};
-/// use tantivy::{Index, Result, Term};
 /// use tantivy::collector::{Count, TopDocs};
 /// use tantivy::query::TermQuery;
-///
-/// # fn main() { example().unwrap(); }
-/// fn example() -> Result<()> {
-///     let mut schema_builder = Schema::builder();
-///     let title = schema_builder.add_text_field("title", TEXT);
-///     let schema = schema_builder.build();
-///     let index = Index::create_in_ram(schema);
-///     {
-///         let mut index_writer = index.writer(3_000_000)?;
-///         index_writer.add_document(doc!(
-///             title => "The Name of the Wind",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of Muadib",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "A Dairy Cow",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of a Young Girl",
-///         ));
-///         index_writer.commit()?;
-///     }
-///     let reader = index.reader()?;
-///     let searcher = reader.searcher();
-///
-///     let query = TermQuery::new(
-///         Term::from_field_text(title, "diary"),
-///         IndexRecordOption::Basic,
-///     );
-///     let (top_docs, count) = searcher.search(&query, &(TopDocs::with_limit(2), Count)).unwrap();
-///     assert_eq!(count, 2);
-///
-///     Ok(())
+/// use tantivy::schema::{Schema, TEXT, IndexRecordOption};
+/// use tantivy::{doc, Index, Term};
+/// # fn test() -> tantivy::Result<()> {
+/// let mut schema_builder = Schema::builder();
+/// let title = schema_builder.add_text_field("title", TEXT);
+/// let schema = schema_builder.build();
+/// let index = Index::create_in_ram(schema);
+/// {
+///     let mut index_writer = index.writer(3_000_000)?;
+///     index_writer.add_document(doc!(
+///         title => "The Name of the Wind",
+///     ));
+///     index_writer.add_document(doc!(
+///         title => "The Diary of Muadib",
+///     ));
+///     index_writer.add_document(doc!(
+///         title => "A Dairy Cow",
+///     ));
+///     index_writer.add_document(doc!(
+///         title => "The Diary of a Young Girl",
+///     ));
+///     index_writer.commit()?;
 /// }
+/// let reader = index.reader()?;
+/// let searcher = reader.searcher();
+/// let query = TermQuery::new(
+///     Term::from_field_text(title, "diary"),
+///     IndexRecordOption::Basic,
+/// );
+/// let (top_docs, count) = searcher.search(&query, &(TopDocs::with_limit(2), Count))?;
+/// assert_eq!(count, 2);
+/// Ok(())
+/// # }
+/// # assert!(test().is_ok());
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TermQuery {
     term: Term,
     index_record_option: IndexRecordOption,
+}
+
+impl fmt::Debug for TermQuery {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TermQuery({:?})", self.term)
+    }
 }
 
 impl TermQuery {
@@ -99,7 +100,7 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
-    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> Result<Box<dyn Weight>> {
+    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight(searcher, scoring_enabled)))
     }
     fn query_terms(&self, term_set: &mut BTreeSet<Term>) {

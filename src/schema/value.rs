@@ -1,25 +1,67 @@
 use crate::schema::Facet;
+use crate::tokenizer::PreTokenizedString;
 use crate::DateTime;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 /// Value represents the value of a any field.
 /// It is an enum over all over all of the possible field type.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum Value {
     /// The str type is used for any text information.
     Str(String),
+    /// Pre-tokenized str type,
+    PreTokStr(PreTokenizedString),
     /// Unsigned 64-bits Integer `u64`
     U64(u64),
     /// Signed 64-bits Integer `i64`
     I64(i64),
+    /// 64-bits Float `f64`
+    F64(f64),
     /// Signed 64-bits Date time stamp `date`
     Date(DateTime),
     /// Hierarchical Facet
     Facet(Facet),
     /// Arbitrarily sized byte array
     Bytes(Vec<u8>),
+}
+
+impl Eq for Value {}
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Value::Str(l), Value::Str(r)) => l.cmp(r),
+            (Value::PreTokStr(l), Value::PreTokStr(r)) => l.cmp(r),
+            (Value::U64(l), Value::U64(r)) => l.cmp(r),
+            (Value::I64(l), Value::I64(r)) => l.cmp(r),
+            (Value::Date(l), Value::Date(r)) => l.cmp(r),
+            (Value::Facet(l), Value::Facet(r)) => l.cmp(r),
+            (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
+            (Value::F64(l), Value::F64(r)) => {
+                match (l.is_nan(), r.is_nan()) {
+                    (false, false) => l.partial_cmp(r).unwrap(), // only fail on NaN
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less, // we define NaN as less than -∞
+                    (false, true) => Ordering::Greater,
+                }
+            }
+            (Value::Str(_), _) => Ordering::Less,
+            (_, Value::Str(_)) => Ordering::Greater,
+            (Value::PreTokStr(_), _) => Ordering::Less,
+            (_, Value::PreTokStr(_)) => Ordering::Greater,
+            (Value::U64(_), _) => Ordering::Less,
+            (_, Value::U64(_)) => Ordering::Greater,
+            (Value::I64(_), _) => Ordering::Less,
+            (_, Value::I64(_)) => Ordering::Greater,
+            (Value::F64(_), _) => Ordering::Less,
+            (_, Value::F64(_)) => Ordering::Greater,
+            (Value::Date(_), _) => Ordering::Less,
+            (_, Value::Date(_)) => Ordering::Greater,
+            (Value::Facet(_), _) => Ordering::Less,
+            (_, Value::Facet(_)) => Ordering::Greater,
+        }
+    }
 }
 
 impl Serialize for Value {
@@ -29,9 +71,11 @@ impl Serialize for Value {
     {
         match *self {
             Value::Str(ref v) => serializer.serialize_str(v),
+            Value::PreTokStr(ref v) => v.serialize(serializer),
             Value::U64(u) => serializer.serialize_u64(u),
             Value::I64(u) => serializer.serialize_i64(u),
-            Value::Date(ref date) => serializer.serialize_i64(date.timestamp()),
+            Value::F64(u) => serializer.serialize_f64(u),
+            Value::Date(ref date) => serializer.serialize_str(&date.to_rfc3339()),
             Value::Facet(ref facet) => facet.serialize(serializer),
             Value::Bytes(ref bytes) => serializer.serialize_bytes(bytes),
         }
@@ -52,12 +96,16 @@ impl<'de> Deserialize<'de> for Value {
                 formatter.write_str("a string or u32")
             }
 
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Value::I64(v))
+            }
+
             fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
                 Ok(Value::U64(v))
             }
 
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(Value::I64(v))
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(Value::F64(v))
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
@@ -75,12 +123,19 @@ impl<'de> Deserialize<'de> for Value {
 
 impl Value {
     /// Returns the text value, provided the value is of the `Str` type.
-    ///
-    /// # Panics
-    /// If the value is not of type `Str`
+    /// (Returns None if the value is not of the `Str` type).
     pub fn text(&self) -> Option<&str> {
         match *self {
             Value::Str(ref text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns the tokenized text, provided the value is of the `PreTokStr` type.
+    /// (Returns None if the value is not of the `PreTokStr` type).
+    pub fn tokenized_text(&self) -> Option<&PreTokenizedString> {
+        match *self {
+            Value::PreTokStr(ref tok_text) => Some(tok_text),
             _ => None,
         }
     }
@@ -92,7 +147,7 @@ impl Value {
     pub fn u64_value(&self) -> u64 {
         match *self {
             Value::U64(ref value) => *value,
-            _ => panic!("This is not a text field."),
+            _ => panic!("This is not a u64 field."),
         }
     }
 
@@ -103,7 +158,18 @@ impl Value {
     pub fn i64_value(&self) -> i64 {
         match *self {
             Value::I64(ref value) => *value,
-            _ => panic!("This is not a text field."),
+            _ => panic!("This is not a i64 field."),
+        }
+    }
+
+    /// Returns the f64-value, provided the value is of the `F64` type.
+    ///
+    /// # Panics
+    /// If the value is not of type `F64`
+    pub fn f64_value(&self) -> f64 {
+        match *self {
+            Value::F64(ref value) => *value,
+            _ => panic!("This is not a f64 field."),
         }
     }
 
@@ -137,8 +203,14 @@ impl From<i64> for Value {
     }
 }
 
-impl From<DateTime> for Value {
-    fn from(date_time: DateTime) -> Value {
+impl From<f64> for Value {
+    fn from(v: f64) -> Value {
+        Value::F64(v)
+    }
+}
+
+impl From<crate::DateTime> for Value {
+    fn from(date_time: crate::DateTime) -> Value {
         Value::Date(date_time)
     }
 }
@@ -161,10 +233,17 @@ impl From<Vec<u8>> for Value {
     }
 }
 
+impl From<PreTokenizedString> for Value {
+    fn from(pretokenized_string: PreTokenizedString) -> Value {
+        Value::PreTokStr(pretokenized_string)
+    }
+}
+
 mod binary_serialize {
     use super::Value;
-    use crate::common::BinarySerializable;
+    use crate::common::{f64_to_u64, u64_to_f64, BinarySerializable};
     use crate::schema::Facet;
+    use crate::tokenizer::PreTokenizedString;
     use chrono::{TimeZone, Utc};
     use std::io::{self, Read, Write};
 
@@ -174,6 +253,12 @@ mod binary_serialize {
     const HIERARCHICAL_FACET_CODE: u8 = 3;
     const BYTES_CODE: u8 = 4;
     const DATE_CODE: u8 = 5;
+    const F64_CODE: u8 = 6;
+    const EXT_CODE: u8 = 7;
+
+    // extended types
+
+    const TOK_STR_CODE: u8 = 0;
 
     impl BinarySerializable for Value {
         fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -182,6 +267,18 @@ mod binary_serialize {
                     TEXT_CODE.serialize(writer)?;
                     text.serialize(writer)
                 }
+                Value::PreTokStr(ref tok_str) => {
+                    EXT_CODE.serialize(writer)?;
+                    TOK_STR_CODE.serialize(writer)?;
+                    if let Ok(text) = serde_json::to_string(tok_str) {
+                        text.serialize(writer)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Failed to dump Value::PreTokStr(_) to json.",
+                        ))
+                    }
+                }
                 Value::U64(ref val) => {
                     U64_CODE.serialize(writer)?;
                     val.serialize(writer)
@@ -189,6 +286,10 @@ mod binary_serialize {
                 Value::I64(ref val) => {
                     I64_CODE.serialize(writer)?;
                     val.serialize(writer)
+                }
+                Value::F64(ref val) => {
+                    F64_CODE.serialize(writer)?;
+                    f64_to_u64(*val).serialize(writer)
                 }
                 Value::Date(ref val) => {
                     DATE_CODE.serialize(writer)?;
@@ -219,17 +320,59 @@ mod binary_serialize {
                     let value = i64::deserialize(reader)?;
                     Ok(Value::I64(value))
                 }
+                F64_CODE => {
+                    let value = u64_to_f64(u64::deserialize(reader)?);
+                    Ok(Value::F64(value))
+                }
                 DATE_CODE => {
                     let timestamp = i64::deserialize(reader)?;
                     Ok(Value::Date(Utc.timestamp(timestamp, 0)))
                 }
                 HIERARCHICAL_FACET_CODE => Ok(Value::Facet(Facet::deserialize(reader)?)),
                 BYTES_CODE => Ok(Value::Bytes(Vec::<u8>::deserialize(reader)?)),
+                EXT_CODE => {
+                    let ext_type_code = u8::deserialize(reader)?;
+                    match ext_type_code {
+                        TOK_STR_CODE => {
+                            let str_val = String::deserialize(reader)?;
+                            if let Ok(value) = serde_json::from_str::<PreTokenizedString>(&str_val)
+                            {
+                                Ok(Value::PreTokStr(value))
+                            } else {
+                                Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "Failed to parse string data as Value::PreTokStr(_).",
+                                ))
+                            }
+                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "No extened field type is associated with code {:?}",
+                                ext_type_code
+                            ),
+                        )),
+                    }
+                }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("No field type is associated with code {:?}", type_code),
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+    use crate::DateTime;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_serialize_date() {
+        let value = Value::Date(DateTime::from_str("1996-12-20T00:39:57+00:00").unwrap());
+        let serialized_value_json = serde_json::to_string_pretty(&value).unwrap();
+        assert_eq!(serialized_value_json, r#""1996-12-20T00:39:57+00:00""#);
     }
 }

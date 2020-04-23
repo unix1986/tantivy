@@ -8,13 +8,23 @@ use crate::DocId;
 use crate::Score;
 use crate::SegmentLocalId;
 
+pub const TEST_COLLECTOR_WITH_SCORE: TestCollector = TestCollector {
+    compute_score: true,
+};
+
+pub const TEST_COLLECTOR_WITHOUT_SCORE: TestCollector = TestCollector {
+    compute_score: true,
+};
+
 /// Stores all of the doc ids.
 /// This collector is only used for tests.
 /// It is unusable in pr
 ///
 /// actise, as it does not store
 /// the segment ordinals
-pub struct TestCollector;
+pub struct TestCollector {
+    pub compute_score: bool,
+}
 
 pub struct TestSegmentCollector {
     segment_id: SegmentLocalId,
@@ -32,7 +42,6 @@ impl TestFruit {
     pub fn docs(&self) -> &[DocAddress] {
         &self.docs[..]
     }
-
     pub fn scores(&self) -> &[Score] {
         &self.scores[..]
     }
@@ -46,7 +55,7 @@ impl Collector for TestCollector {
         &self,
         segment_id: SegmentLocalId,
         _reader: &SegmentReader,
-    ) -> Result<TestSegmentCollector> {
+    ) -> crate::Result<TestSegmentCollector> {
         Ok(TestSegmentCollector {
             segment_id,
             fruit: TestFruit::default(),
@@ -54,10 +63,10 @@ impl Collector for TestCollector {
     }
 
     fn requires_scoring(&self) -> bool {
-        true
+        self.compute_score
     }
 
-    fn merge_fruits(&self, mut children: Vec<TestFruit>) -> Result<TestFruit> {
+    fn merge_fruits(&self, mut children: Vec<TestFruit>) -> crate::Result<TestFruit> {
         children.sort_by_key(|fruit| {
             if fruit.docs().is_empty() {
                 0
@@ -115,7 +124,7 @@ impl Collector for FastFieldTestCollector {
         &self,
         _: SegmentLocalId,
         segment_reader: &SegmentReader,
-    ) -> Result<FastFieldSegmentCollector> {
+    ) -> crate::Result<FastFieldSegmentCollector> {
         let reader = segment_reader
             .fast_fields()
             .u64(self.field)
@@ -130,7 +139,7 @@ impl Collector for FastFieldTestCollector {
         false
     }
 
-    fn merge_fruits(&self, children: Vec<Vec<u64>>) -> Result<Vec<u64>> {
+    fn merge_fruits(&self, children: Vec<Vec<u64>>) -> crate::Result<Vec<u64>> {
         Ok(children.into_iter().flat_map(|v| v.into_iter()).collect())
     }
 }
@@ -175,7 +184,7 @@ impl Collector for BytesFastFieldTestCollector {
         &self,
         _segment_local_id: u32,
         segment_reader: &SegmentReader,
-    ) -> Result<BytesFastFieldSegmentCollector> {
+    ) -> crate::Result<BytesFastFieldSegmentCollector> {
         Ok(BytesFastFieldSegmentCollector {
             vals: Vec::new(),
             reader: segment_reader
@@ -189,7 +198,7 @@ impl Collector for BytesFastFieldTestCollector {
         false
     }
 
-    fn merge_fruits(&self, children: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    fn merge_fruits(&self, children: Vec<Vec<u8>>) -> crate::Result<Vec<u8>> {
         Ok(children.into_iter().flat_map(|c| c.into_iter()).collect())
     }
 }

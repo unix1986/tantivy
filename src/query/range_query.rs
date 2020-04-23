@@ -38,45 +38,33 @@ fn map_bound<TFrom, TTo, Transform: Fn(&TFrom) -> TTo>(
 /// # Example
 ///
 /// ```rust
+/// use tantivy::collector::Count;
+/// use tantivy::query::RangeQuery;
+/// use tantivy::schema::{Schema, INDEXED};
+/// use tantivy::{doc, Index};
+/// # fn test() -> tantivy::Result<()> {
+/// let mut schema_builder = Schema::builder();
+/// let year_field = schema_builder.add_u64_field("year", INDEXED);
+/// let schema = schema_builder.build();
 ///
-/// # #[macro_use]
-/// # extern crate tantivy;
-/// # use tantivy::Index;
-/// # use tantivy::schema::{Schema, INDEXED};
-/// # use tantivy::collector::Count;
-/// # use tantivy::Result;
-/// # use tantivy::query::RangeQuery;
-/// #
-/// # fn run() -> Result<()> {
-/// #     let mut schema_builder = Schema::builder();
-/// #     let year_field = schema_builder.add_u64_field("year", INDEXED);
-/// #     let schema = schema_builder.build();
-/// #
-/// #     let index = Index::create_in_ram(schema);
-/// #     {
-/// #         let mut index_writer = index.writer_with_num_threads(1, 6_000_000).unwrap();
-/// #         for year in 1950u64..2017u64 {
-/// #             let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
-/// #             for _ in 0..num_docs_within_year {
-/// #                 index_writer.add_document(doc!(year_field => year));
-/// #             }
-/// #         }
-/// #         index_writer.commit().unwrap();
-/// #     }
-/// #   let reader = index.reader()?;
+/// let index = Index::create_in_ram(schema);
+/// let mut index_writer = index.writer_with_num_threads(1, 6_000_000)?;
+/// for year in 1950u64..2017u64 {
+///     let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
+///     for _ in 0..num_docs_within_year {
+///       index_writer.add_document(doc!(year_field => year));
+///     }
+/// }
+/// index_writer.commit()?;
+///
+/// let reader = index.reader()?;
 /// let searcher = reader.searcher();
-///
 /// let docs_in_the_sixties = RangeQuery::new_u64(year_field, 1960..1970);
-///
 /// let num_60s_books = searcher.search(&docs_in_the_sixties, &Count)?;
-///
-/// #     assert_eq!(num_60s_books, 2285);
-/// #     Ok(())
+/// assert_eq!(num_60s_books, 2285);
+/// Ok(())
 /// # }
-/// #
-/// # fn main() {
-/// #   run().unwrap()
-/// # }
+/// # assert!(test().is_ok());
 /// ```
 #[derive(Clone, Debug)]
 pub struct RangeQuery {
@@ -137,6 +125,39 @@ impl RangeQuery {
         RangeQuery {
             field,
             value_type: Type::I64,
+            left_bound: map_bound(&left_bound, &make_term_val),
+            right_bound: map_bound(&right_bound, &make_term_val),
+        }
+    }
+
+    /// Creates a new `RangeQuery` over a `f64` field.
+    ///
+    /// If the field is not of the type `f64`, tantivy
+    /// will panic when the `Weight` object is created.
+    pub fn new_f64(field: Field, range: Range<f64>) -> RangeQuery {
+        RangeQuery::new_f64_bounds(
+            field,
+            Bound::Included(range.start),
+            Bound::Excluded(range.end),
+        )
+    }
+
+    /// Create a new `RangeQuery` over a `f64` field.
+    ///
+    /// The two `Bound` arguments make it possible to create more complex
+    /// ranges than semi-inclusive range.
+    ///
+    /// If the field is not of the type `f64`, tantivy
+    /// will panic when the `Weight` object is created.
+    pub fn new_f64_bounds(
+        field: Field,
+        left_bound: Bound<f64>,
+        right_bound: Bound<f64>,
+    ) -> RangeQuery {
+        let make_term_val = |val: &f64| Term::from_field_f64(field, *val).value_bytes().to_owned();
+        RangeQuery {
+            field,
+            value_type: Type::F64,
             left_bound: map_bound(&left_bound, &make_term_val),
             right_bound: map_bound(&right_bound, &make_term_val),
         }
@@ -268,7 +289,7 @@ impl RangeWeight {
 }
 
 impl Weight for RangeWeight {
-    fn scorer(&self, reader: &SegmentReader) -> Result<Box<dyn Scorer>> {
+    fn scorer(&self, reader: &SegmentReader, boost: f32) -> Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
 
@@ -286,11 +307,11 @@ impl Weight for RangeWeight {
             }
         }
         let doc_bitset = BitSetDocSet::from(doc_bitset);
-        Ok(Box::new(ConstScorer::new(doc_bitset)))
+        Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
-        let mut scorer = self.scorer(reader)?;
+        let mut scorer = self.scorer(reader, 1.0f32)?;
         if scorer.skip_next(doc) != SkipResult::Reached {
             return Err(does_not_match(doc));
         }
@@ -305,39 +326,33 @@ mod tests {
     use crate::collector::Count;
     use crate::schema::{Document, Field, Schema, INDEXED};
     use crate::Index;
-    use crate::Result;
     use std::collections::Bound;
 
     #[test]
     fn test_range_query_simple() {
-        fn run() -> Result<()> {
-            let mut schema_builder = Schema::builder();
-            let year_field = schema_builder.add_u64_field("year", INDEXED);
-            let schema = schema_builder.build();
+        let mut schema_builder = Schema::builder();
+        let year_field = schema_builder.add_u64_field("year", INDEXED);
+        let schema = schema_builder.build();
 
-            let index = Index::create_in_ram(schema);
-            {
-                let mut index_writer = index.writer_with_num_threads(1, 6_000_000).unwrap();
-                for year in 1950u64..2017u64 {
-                    let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
-                    for _ in 0..num_docs_within_year {
-                        index_writer.add_document(doc!(year_field => year));
-                    }
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 6_000_000).unwrap();
+            for year in 1950u64..2017u64 {
+                let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
+                for _ in 0..num_docs_within_year {
+                    index_writer.add_document(doc!(year_field => year));
                 }
-                index_writer.commit().unwrap();
             }
-            let reader = index.reader().unwrap();
-            let searcher = reader.searcher();
-
-            let docs_in_the_sixties = RangeQuery::new_u64(year_field, 1960u64..1970u64);
-
-            // ... or `1960..=1969` if inclusive range is enabled.
-            let count = searcher.search(&docs_in_the_sixties, &Count)?;
-            assert_eq!(count, 2285);
-            Ok(())
+            index_writer.commit().unwrap();
         }
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
 
-        run().unwrap();
+        let docs_in_the_sixties = RangeQuery::new_u64(year_field, 1960u64..1970u64);
+
+        // ... or `1960..=1969` if inclusive range is enabled.
+        let count = searcher.search(&docs_in_the_sixties, &Count).unwrap();
+        assert_eq!(count, 2285);
     }
 
     #[test]
@@ -397,4 +412,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_range_float() {
+        let float_field: Field;
+        let schema = {
+            let mut schema_builder = Schema::builder();
+            float_field = schema_builder.add_f64_field("floatfield", INDEXED);
+            schema_builder.build()
+        };
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_with_num_threads(2, 6_000_000).unwrap();
+
+            for i in 1..100 {
+                let mut doc = Document::new();
+                for j in 1..100 {
+                    if i % j == 0 {
+                        doc.add_f64(float_field, j as f64);
+                    }
+                }
+                index_writer.add_document(doc);
+            }
+
+            index_writer.commit().unwrap();
+        }
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let count_multiples =
+            |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
+
+        assert_eq!(
+            count_multiples(RangeQuery::new_f64(float_field, 10.0..11.0)),
+            9
+        );
+        assert_eq!(
+            count_multiples(RangeQuery::new_f64_bounds(
+                float_field,
+                Bound::Included(10.0),
+                Bound::Included(11.0)
+            )),
+            18
+        );
+        assert_eq!(
+            count_multiples(RangeQuery::new_f64_bounds(
+                float_field,
+                Bound::Excluded(9.0),
+                Bound::Included(10.0)
+            )),
+            9
+        );
+        assert_eq!(
+            count_multiples(RangeQuery::new_f64_bounds(
+                float_field,
+                Bound::Included(9.0),
+                Bound::Unbounded
+            )),
+            91
+        );
+    }
 }

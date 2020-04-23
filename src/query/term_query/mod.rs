@@ -12,7 +12,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::docset::DocSet;
     use crate::query::{Query, QueryParser, Scorer, TermQuery};
-    use crate::schema::{IndexRecordOption, Schema, STRING, TEXT};
+    use crate::schema::{Field, IndexRecordOption, Schema, STRING, TEXT};
     use crate::tests::assert_nearly_equals;
     use crate::Index;
     use crate::Term;
@@ -39,7 +39,7 @@ mod tests {
         );
         let term_weight = term_query.weight(&searcher, true).unwrap();
         let segment_reader = searcher.segment_reader(0);
-        let mut term_scorer = term_weight.scorer(segment_reader).unwrap();
+        let mut term_scorer = term_weight.scorer(segment_reader, 1.0f32).unwrap();
         assert!(term_scorer.advance());
         assert_eq!(term_scorer.doc(), 0);
         assert_eq!(term_scorer.score(), 0.28768212);
@@ -113,5 +113,17 @@ mod tests {
         let term_query = TermQuery::new(term_a, IndexRecordOption::Basic);
         let reader = index.reader().unwrap();
         assert_eq!(term_query.count(&*reader.searcher()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_term_query_debug() {
+        let term_query = TermQuery::new(
+            Term::from_field_text(Field::from_field_id(1), "hello"),
+            IndexRecordOption::WithFreqs,
+        );
+        assert_eq!(
+            format!("{:?}", term_query),
+            "TermQuery(Term(field=1,bytes=[104, 101, 108, 108, 111]))"
+        );
     }
 }

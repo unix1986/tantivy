@@ -1,8 +1,9 @@
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
-use crate::query::Occur;
+use crate::Occur;
 
+#[derive(PartialEq)]
 pub enum UserInputLeaf {
     Literal(UserInputLiteral),
     All,
@@ -35,6 +36,7 @@ impl Debug for UserInputLeaf {
     }
 }
 
+#[derive(PartialEq)]
 pub struct UserInputLiteral {
     pub field_name: Option<String>,
     pub phrase: String,
@@ -49,9 +51,11 @@ impl fmt::Debug for UserInputLiteral {
     }
 }
 
+#[derive(PartialEq)]
 pub enum UserInputBound {
     Inclusive(String),
     Exclusive(String),
+    Unbounded,
 }
 
 impl UserInputBound {
@@ -59,6 +63,7 @@ impl UserInputBound {
         match *self {
             UserInputBound::Inclusive(ref word) => write!(formatter, "[\"{}\"", word),
             UserInputBound::Exclusive(ref word) => write!(formatter, "{{\"{}\"", word),
+            UserInputBound::Unbounded => write!(formatter, "{{\"*\""),
         }
     }
 
@@ -66,6 +71,7 @@ impl UserInputBound {
         match *self {
             UserInputBound::Inclusive(ref word) => write!(formatter, "\"{}\"]", word),
             UserInputBound::Exclusive(ref word) => write!(formatter, "\"{}\"}}", word),
+            UserInputBound::Unbounded => write!(formatter, "\"*\"}}"),
         }
     }
 
@@ -73,36 +79,38 @@ impl UserInputBound {
         match *self {
             UserInputBound::Inclusive(ref contents) => contents,
             UserInputBound::Exclusive(ref contents) => contents,
+            UserInputBound::Unbounded => &"*",
         }
     }
 }
 
 pub enum UserInputAST {
-    Clause(Vec<UserInputAST>),
-    Unary(Occur, Box<UserInputAST>),
-    //    Not(Box<UserInputAST>),
-    //    Should(Box<UserInputAST>),
-    //    Must(Box<UserInputAST>),
+    Clause(Vec<(Option<Occur>, UserInputAST)>),
     Leaf(Box<UserInputLeaf>),
+    Boost(Box<UserInputAST>, f32),
 }
 
 impl UserInputAST {
     pub fn unary(self, occur: Occur) -> UserInputAST {
-        UserInputAST::Unary(occur, Box::new(self))
+        UserInputAST::Clause(vec![(Some(occur), self)])
     }
 
     fn compose(occur: Occur, asts: Vec<UserInputAST>) -> UserInputAST {
-        assert!(occur != Occur::MustNot);
+        assert_ne!(occur, Occur::MustNot);
         assert!(!asts.is_empty());
         if asts.len() == 1 {
             asts.into_iter().next().unwrap() //< safe
         } else {
             UserInputAST::Clause(
                 asts.into_iter()
-                    .map(|ast: UserInputAST| ast.unary(occur))
+                    .map(|ast: UserInputAST| (Some(occur), ast))
                     .collect::<Vec<_>>(),
             )
         }
+    }
+
+    pub fn empty_query() -> UserInputAST {
+        UserInputAST::Clause(Vec::default())
     }
 
     pub fn and(asts: Vec<UserInputAST>) -> UserInputAST {
@@ -113,42 +121,6 @@ impl UserInputAST {
         UserInputAST::compose(Occur::Should, asts)
     }
 }
-
-/*
-impl UserInputAST {
-
-    fn compose_occur(self, occur: Occur) -> UserInputAST {
-        match self {
-            UserInputAST::Not(other) => {
-                let new_occur = compose_occur(Occur::MustNot, occur);
-                other.simplify()
-            }
-            _ => {
-                self
-            }
-        }
-    }
-
-    pub fn simplify(self) -> UserInputAST {
-        match self {
-            UserInputAST::Clause(els) => {
-                if els.len() == 1 {
-                    return els.into_iter().next().unwrap();
-                } else {
-                    return self;
-                }
-            }
-            UserInputAST::Not(els) => {
-                if els.len() == 1 {
-                    return els.into_iter().next().unwrap();
-                } else {
-                    return self;
-                }
-            }
-        }
-    }
-}
-*/
 
 impl From<UserInputLiteral> for UserInputLeaf {
     fn from(literal: UserInputLiteral) -> UserInputLeaf {
@@ -162,26 +134,38 @@ impl From<UserInputLeaf> for UserInputAST {
     }
 }
 
+fn print_occur_ast(
+    occur_opt: Option<Occur>,
+    ast: &UserInputAST,
+    formatter: &mut fmt::Formatter,
+) -> fmt::Result {
+    if let Some(occur) = occur_opt {
+        write!(formatter, "{}{:?}", occur, ast)?;
+    } else {
+        write!(formatter, "*{:?}", ast)?;
+    }
+    Ok(())
+}
+
 impl fmt::Debug for UserInputAST {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             UserInputAST::Clause(ref subqueries) => {
                 if subqueries.is_empty() {
                     write!(formatter, "<emptyclause>")?;
                 } else {
                     write!(formatter, "(")?;
-                    write!(formatter, "{:?}", &subqueries[0])?;
+                    print_occur_ast(subqueries[0].0, &subqueries[0].1, formatter)?;
                     for subquery in &subqueries[1..] {
-                        write!(formatter, " {:?}", subquery)?;
+                        write!(formatter, " ")?;
+                        print_occur_ast(subquery.0, &subquery.1, formatter)?;
                     }
                     write!(formatter, ")")?;
                 }
                 Ok(())
             }
-            UserInputAST::Unary(ref occur, ref subquery) => {
-                write!(formatter, "{}({:?})", occur.to_char(), subquery)
-            }
             UserInputAST::Leaf(ref subquery) => write!(formatter, "{:?}", subquery),
+            UserInputAST::Boost(ref leaf, boost) => write!(formatter, "({:?})^{}", leaf, boost),
         }
     }
 }

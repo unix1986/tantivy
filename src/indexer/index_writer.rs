@@ -1,13 +1,15 @@
 use super::operation::{AddOperation, UserOperation};
 use super::segment_updater::SegmentUpdater;
 use super::PreparedCommit;
+use crate::common::BitSet;
 use crate::core::Index;
 use crate::core::Segment;
 use crate::core::SegmentComponent;
 use crate::core::SegmentId;
 use crate::core::SegmentMeta;
 use crate::core::SegmentReader;
-use crate::directory::DirectoryLock;
+use crate::directory::TerminatingWrite;
+use crate::directory::{DirectoryLock, GarbageCollectionResult};
 use crate::docset::DocSet;
 use crate::error::TantivyError;
 use crate::fastfield::write_delete_bitset;
@@ -18,15 +20,15 @@ use crate::indexer::stamper::Stamper;
 use crate::indexer::MergePolicy;
 use crate::indexer::SegmentEntry;
 use crate::indexer::SegmentWriter;
-use crate::postings::compute_table_size;
 use crate::schema::Document;
 use crate::schema::IndexRecordOption;
 use crate::schema::Term;
 use crate::Opstamp;
-use crate::Result;
-use bit_set::BitSet;
 use crossbeam::channel;
-use futures::{Canceled, Future};
+use futures::executor::block_on;
+use futures::future::Future;
+use smallvec::smallvec;
+use smallvec::SmallVec;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
@@ -45,29 +47,15 @@ pub const HEAP_SIZE_MAX: usize = u32::max_value() as usize - MARGIN_IN_BYTES;
 // reaches `PIPELINE_MAX_SIZE_IN_DOCS`
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
-type OperationSender = channel::Sender<Vec<AddOperation>>;
-type OperationReceiver = channel::Receiver<Vec<AddOperation>>;
-
-/// Split the thread memory budget into
-/// - the heap size
-/// - the hash table "table" itself.
-///
-/// Returns (the heap size in bytes, the hash table size in number of bits)
-fn initial_table_size(per_thread_memory_budget: usize) -> usize {
-    assert!(per_thread_memory_budget > 1_000);
-    let table_size_limit: usize = per_thread_memory_budget / 3;
-    if let Some(limit) = (1..)
-        .take_while(|num_bits: &usize| compute_table_size(*num_bits) < table_size_limit)
-        .last()
-    {
-        limit.min(19) // we cap it at 2^19 = 512K.
-    } else {
-        unreachable!(
-            "Per thread memory is too small: {}",
-            per_thread_memory_budget
-        );
-    }
-}
+// Group of operations.
+// Most of the time, users will send operation one-by-one, but it can be useful to
+// send them as a small block to ensure that
+// - all docs in the operation will happen on the same segment and continuous docids.
+// - all operations in the group are committed at the same time, making the group
+// atomic.
+type OperationGroup = SmallVec<[AddOperation; 4]>;
+type OperationSender = channel::Sender<OperationGroup>;
+type OperationReceiver = channel::Receiver<OperationGroup>;
 
 /// `IndexWriter` is the user entry-point to add document to an index.
 ///
@@ -84,7 +72,7 @@ pub struct IndexWriter {
 
     heap_size_in_bytes_per_thread: usize,
 
-    workers_join_handle: Vec<JoinHandle<Result<()>>>,
+    workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
     operation_receiver: OperationReceiver,
     operation_sender: OperationSender,
@@ -95,189 +83,124 @@ pub struct IndexWriter {
 
     num_threads: usize,
 
-    generation: usize,
-
     delete_queue: DeleteQueue,
 
     stamper: Stamper,
     committed_opstamp: Opstamp,
 }
 
-/// Open a new index writer. Attempts to acquire a lockfile.
-///
-/// The lockfile should be deleted on drop, but it is possible
-/// that due to a panic or other error, a stale lockfile will be
-/// left in the index directory. If you are sure that no other
-/// `IndexWriter` on the system is accessing the index directory,
-/// it is safe to manually delete the lockfile.
-///
-/// `num_threads` specifies the number of indexing workers that
-/// should work at the same time.
-/// # Errors
-/// If the lockfile already exists, returns `Error::FileAlreadyExists`.
-/// # Panics
-/// If the heap size per thread is too small, panics.
-pub fn open_index_writer(
-    index: &Index,
-    num_threads: usize,
-    heap_size_in_bytes_per_thread: usize,
-    directory_lock: DirectoryLock,
-) -> Result<IndexWriter> {
-    if heap_size_in_bytes_per_thread < HEAP_SIZE_MIN {
-        let err_msg = format!(
-            "The heap size per thread needs to be at least {}.",
-            HEAP_SIZE_MIN
-        );
-        return Err(TantivyError::InvalidArgument(err_msg));
-    }
-    if heap_size_in_bytes_per_thread >= HEAP_SIZE_MAX {
-        let err_msg = format!("The heap size per thread cannot exceed {}", HEAP_SIZE_MAX);
-        return Err(TantivyError::InvalidArgument(err_msg));
-    }
-    let (document_sender, document_receiver): (OperationSender, OperationReceiver) =
-        channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
-
-    let delete_queue = DeleteQueue::new();
-
-    let current_opstamp = index.load_metas()?.opstamp;
-
-    let stamper = Stamper::new(current_opstamp);
-
-    let segment_updater =
-        SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
-
-    let mut index_writer = IndexWriter {
-        _directory_lock: Some(directory_lock),
-
-        heap_size_in_bytes_per_thread,
-        index: index.clone(),
-
-        operation_receiver: document_receiver,
-        operation_sender: document_sender,
-
-        segment_updater,
-
-        workers_join_handle: vec![],
-        num_threads,
-
-        delete_queue,
-
-        committed_opstamp: current_opstamp,
-        stamper,
-
-        generation: 0,
-
-        worker_id: 0,
-    };
-    index_writer.start_workers()?;
-    Ok(index_writer)
-}
-
-pub fn compute_deleted_bitset(
+fn compute_deleted_bitset(
     delete_bitset: &mut BitSet,
     segment_reader: &SegmentReader,
     delete_cursor: &mut DeleteCursor,
     doc_opstamps: &DocToOpstampMapping,
     target_opstamp: Opstamp,
-) -> Result<bool> {
+) -> crate::Result<bool> {
     let mut might_have_changed = false;
-
-    #[cfg_attr(feature = "cargo-clippy", allow(clippy::while_let_loop))]
-    loop {
-        if let Some(delete_op) = delete_cursor.get() {
-            if delete_op.opstamp > target_opstamp {
-                break;
-            } else {
-                // A delete operation should only affect
-                // document that were inserted after it.
-                //
-                // Limit doc helps identify the first document
-                // that may be affected by the delete operation.
-                let limit_doc = doc_opstamps.compute_doc_limit(delete_op.opstamp);
-                let inverted_index = segment_reader.inverted_index(delete_op.term.field());
-                if let Some(mut docset) =
-                    inverted_index.read_postings(&delete_op.term, IndexRecordOption::Basic)
-                {
-                    while docset.advance() {
-                        let deleted_doc = docset.doc();
-                        if deleted_doc < limit_doc {
-                            delete_bitset.insert(deleted_doc as usize);
-                            might_have_changed = true;
-                        }
-                    }
-                }
-            }
-        } else {
+    while let Some(delete_op) = delete_cursor.get() {
+        if delete_op.opstamp > target_opstamp {
             break;
         }
+
+        // A delete operation should only affect
+        // document that were inserted after it.
+        //
+        // Limit doc helps identify the first document
+        // that may be affected by the delete operation.
+        let limit_doc = doc_opstamps.compute_doc_limit(delete_op.opstamp);
+        let inverted_index = segment_reader.inverted_index(delete_op.term.field());
+        if let Some(mut docset) =
+            inverted_index.read_postings(&delete_op.term, IndexRecordOption::Basic)
+        {
+            while docset.advance() {
+                let deleted_doc = docset.doc();
+                if deleted_doc < limit_doc {
+                    delete_bitset.insert(deleted_doc);
+                    might_have_changed = true;
+                }
+            }
+        }
+
         delete_cursor.advance();
     }
     Ok(might_have_changed)
 }
 
-/// Advance delete for the given segment up
-/// to the target opstamp.
-pub fn advance_deletes(
+/// Advance delete for the given segment up to the target opstamp.
+///
+/// Note that there are no guarantee that the resulting `segment_entry` delete_opstamp
+/// is `==` target_opstamp.
+/// For instance, there was no delete operation between the state of the `segment_entry` and
+/// the `target_opstamp`, `segment_entry` is not updated.
+pub(crate) fn advance_deletes(
     mut segment: Segment,
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
-) -> Result<()> {
-    {
-        if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
-            // We are already up-to-date here.
-            return Ok(());
-        }
+) -> crate::Result<()> {
+    if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
+        // We are already up-to-date here.
+        return Ok(());
+    }
 
-        let segment_reader = SegmentReader::open(&segment)?;
-        let max_doc = segment_reader.max_doc();
+    if segment_entry.delete_bitset().is_none() && segment_entry.delete_cursor().get().is_none() {
+        // There has been no `DeleteOperation` between the segment status and `target_opstamp`.
+        return Ok(());
+    }
 
-        let mut delete_bitset: BitSet = match segment_entry.delete_bitset() {
-            Some(previous_delete_bitset) => (*previous_delete_bitset).clone(),
-            None => BitSet::with_capacity(max_doc as usize),
-        };
+    let segment_reader = SegmentReader::open(&segment)?;
 
-        let delete_cursor = segment_entry.delete_cursor();
+    let max_doc = segment_reader.max_doc();
+    let mut delete_bitset: BitSet = match segment_entry.delete_bitset() {
+        Some(previous_delete_bitset) => (*previous_delete_bitset).clone(),
+        None => BitSet::with_max_value(max_doc),
+    };
 
-        compute_deleted_bitset(
-            &mut delete_bitset,
-            &segment_reader,
-            delete_cursor,
-            &DocToOpstampMapping::None,
-            target_opstamp,
-        )?;
+    let num_deleted_docs_before = segment.meta().num_deleted_docs();
 
-        // TODO optimize
+    compute_deleted_bitset(
+        &mut delete_bitset,
+        &segment_reader,
+        segment_entry.delete_cursor(),
+        &DocToOpstampMapping::None,
+        target_opstamp,
+    )?;
+
+    // TODO optimize
+    // It should be possible to do something smarter by manipulation bitsets directly
+    // to compute this union.
+    if let Some(seg_delete_bitset) = segment_reader.delete_bitset() {
         for doc in 0u32..max_doc {
-            if segment_reader.is_deleted(doc) {
-                delete_bitset.insert(doc as usize);
+            if seg_delete_bitset.is_deleted(doc) {
+                delete_bitset.insert(doc);
             }
         }
-
-        let num_deleted_docs = delete_bitset.len();
-        if num_deleted_docs > 0 {
-            segment = segment.with_delete_meta(num_deleted_docs as u32, target_opstamp);
-            let mut delete_file = segment.open_write(SegmentComponent::DELETE)?;
-            write_delete_bitset(&delete_bitset, &mut delete_file)?;
-        }
     }
+
+    let num_deleted_docs: u32 = delete_bitset.len() as u32;
+    if num_deleted_docs > num_deleted_docs_before {
+        // There are new deletes. We need to write a new delete file.
+        segment = segment.with_delete_meta(num_deleted_docs as u32, target_opstamp);
+        let mut delete_file = segment.open_write(SegmentComponent::DELETE)?;
+        write_delete_bitset(&delete_bitset, max_doc, &mut delete_file)?;
+        delete_file.terminate()?;
+    }
+
     segment_entry.set_meta(segment.meta().clone());
     Ok(())
 }
 
 fn index_documents(
     memory_budget: usize,
-    segment: &Segment,
-    generation: usize,
-    document_iterator: &mut dyn Iterator<Item = Vec<AddOperation>>,
+    segment: Segment,
+    grouped_document_iterator: &mut dyn Iterator<Item = OperationGroup>,
     segment_updater: &mut SegmentUpdater,
     mut delete_cursor: DeleteCursor,
-) -> Result<bool> {
+) -> crate::Result<bool> {
     let schema = segment.schema();
-    let segment_id = segment.id();
-    let table_size = initial_table_size(memory_budget);
-    let mut segment_writer = SegmentWriter::for_segment(table_size, segment.clone(), &schema)?;
-    for documents in document_iterator {
-        for doc in documents {
+
+    let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone(), &schema)?;
+    for document_group in grouped_document_iterator {
+        for doc in document_group {
             segment_writer.add_document(doc, &schema)?;
         }
         let mem_usage = segment_writer.mem_usage();
@@ -294,50 +217,144 @@ fn index_documents(
         return Ok(false);
     }
 
-    let num_docs = segment_writer.max_doc();
+    let max_doc = segment_writer.max_doc();
 
     // this is ensured by the call to peek before starting
     // the worker thread.
-    assert!(num_docs > 0);
+    assert!(max_doc > 0);
 
     let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
 
-    let segment_meta = SegmentMeta::new(segment_id, num_docs);
+    let segment_with_max_doc = segment.with_max_doc(max_doc);
 
     let last_docstamp: Opstamp = *(doc_opstamps.last().unwrap());
 
-    let delete_bitset_opt = if delete_cursor.get().is_some() {
-        let doc_to_opstamps = DocToOpstampMapping::from(doc_opstamps);
-        let segment_reader = SegmentReader::open(segment)?;
-        let mut deleted_bitset = BitSet::with_capacity(num_docs as usize);
-        let may_have_deletes = compute_deleted_bitset(
-            &mut deleted_bitset,
-            &segment_reader,
-            &mut delete_cursor,
-            &doc_to_opstamps,
-            last_docstamp,
-        )?;
-        if may_have_deletes {
-            Some(deleted_bitset)
-        } else {
-            None
-        }
-    } else {
+    let delete_bitset_opt = apply_deletes(
+        &segment_with_max_doc,
+        &mut delete_cursor,
+        &doc_opstamps,
+        last_docstamp,
+    )?;
+
+    let segment_entry = SegmentEntry::new(
+        segment_with_max_doc.meta().clone(),
+        delete_cursor,
+        delete_bitset_opt,
+    );
+    block_on(segment_updater.schedule_add_segment(segment_entry))?;
+    Ok(true)
+}
+
+fn apply_deletes(
+    segment: &Segment,
+    mut delete_cursor: &mut DeleteCursor,
+    doc_opstamps: &[Opstamp],
+    last_docstamp: Opstamp,
+) -> crate::Result<Option<BitSet>> {
+    if delete_cursor.get().is_none() {
         // if there are no delete operation in the queue, no need
         // to even open the segment.
+        return Ok(None);
+    }
+    let segment_reader = SegmentReader::open(segment)?;
+    let doc_to_opstamps = DocToOpstampMapping::from(doc_opstamps);
+
+    let max_doc = segment.meta().max_doc();
+    let mut deleted_bitset = BitSet::with_max_value(max_doc);
+    let may_have_deletes = compute_deleted_bitset(
+        &mut deleted_bitset,
+        &segment_reader,
+        &mut delete_cursor,
+        &doc_to_opstamps,
+        last_docstamp,
+    )?;
+    Ok(if may_have_deletes {
+        Some(deleted_bitset)
+    } else {
         None
-    };
-    let segment_entry = SegmentEntry::new(segment_meta, delete_cursor, delete_bitset_opt);
-    Ok(segment_updater.add_segment(generation, segment_entry))
+    })
 }
 
 impl IndexWriter {
+    /// Create a new index writer. Attempts to acquire a lockfile.
+    ///
+    /// The lockfile should be deleted on drop, but it is possible
+    /// that due to a panic or other error, a stale lockfile will be
+    /// left in the index directory. If you are sure that no other
+    /// `IndexWriter` on the system is accessing the index directory,
+    /// it is safe to manually delete the lockfile.
+    ///
+    /// `num_threads` specifies the number of indexing workers that
+    /// should work at the same time.
+    /// # Errors
+    /// If the lockfile already exists, returns `Error::FileAlreadyExists`.
+    /// # Panics
+    /// If the heap size per thread is too small, panics.
+    pub(crate) fn new(
+        index: &Index,
+        num_threads: usize,
+        heap_size_in_bytes_per_thread: usize,
+        directory_lock: DirectoryLock,
+    ) -> crate::Result<IndexWriter> {
+        if heap_size_in_bytes_per_thread < HEAP_SIZE_MIN {
+            let err_msg = format!(
+                "The heap size per thread needs to be at least {}.",
+                HEAP_SIZE_MIN
+            );
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+        if heap_size_in_bytes_per_thread >= HEAP_SIZE_MAX {
+            let err_msg = format!("The heap size per thread cannot exceed {}", HEAP_SIZE_MAX);
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+        let (document_sender, document_receiver): (OperationSender, OperationReceiver) =
+            channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
+
+        let delete_queue = DeleteQueue::new();
+
+        let current_opstamp = index.load_metas()?.opstamp;
+
+        let stamper = Stamper::new(current_opstamp);
+
+        let segment_updater =
+            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
+
+        let mut index_writer = IndexWriter {
+            _directory_lock: Some(directory_lock),
+
+            heap_size_in_bytes_per_thread,
+            index: index.clone(),
+
+            operation_receiver: document_receiver,
+            operation_sender: document_sender,
+
+            segment_updater,
+
+            workers_join_handle: vec![],
+            num_threads,
+
+            delete_queue,
+
+            committed_opstamp: current_opstamp,
+            stamper,
+
+            worker_id: 0,
+        };
+        index_writer.start_workers()?;
+        Ok(index_writer)
+    }
+
+    fn drop_sender(&mut self) {
+        let (sender, _receiver) = channel::bounded(1);
+        mem::replace(&mut self.operation_sender, sender);
+    }
+
     /// If there are some merging threads, blocks until they all finish their work and
     /// then drop the `IndexWriter`.
-    pub fn wait_merging_threads(mut self) -> Result<()> {
+    pub fn wait_merging_threads(mut self) -> crate::Result<()> {
         // this will stop the indexing thread,
         // dropping the last reference to the segment_updater.
-        drop(self.operation_sender);
+        self.drop_sender();
 
         let former_workers_handles = mem::replace(&mut self.workers_join_handle, vec![]);
         for join_handle in former_workers_handles {
@@ -348,7 +365,6 @@ impl IndexWriter {
                     TantivyError::ErrorInThread("Error in indexing worker thread.".into())
                 })?;
         }
-        drop(self.workers_join_handle);
 
         let result = self
             .segment_updater
@@ -363,11 +379,10 @@ impl IndexWriter {
     }
 
     #[doc(hidden)]
-    pub fn add_segment(&mut self, segment_meta: SegmentMeta) {
+    pub fn add_segment(&self, segment_meta: SegmentMeta) -> crate::Result<()> {
         let delete_cursor = self.delete_queue.cursor();
         let segment_entry = SegmentEntry::new(segment_meta, delete_cursor, None);
-        self.segment_updater
-            .add_segment(self.generation, segment_entry);
+        block_on(self.segment_updater.schedule_add_segment(segment_entry))
     }
 
     /// Creates a new segment.
@@ -384,21 +399,16 @@ impl IndexWriter {
 
     /// Spawns a new worker thread for indexing.
     /// The thread consumes documents from the pipeline.
-    fn add_indexing_worker(&mut self) -> Result<()> {
+    fn add_indexing_worker(&mut self) -> crate::Result<()> {
         let document_receiver_clone = self.operation_receiver.clone();
         let mut segment_updater = self.segment_updater.clone();
-
-        let generation = self.generation;
 
         let mut delete_cursor = self.delete_queue.cursor();
 
         let mem_budget = self.heap_size_in_bytes_per_thread;
         let index = self.index.clone();
-        let join_handle: JoinHandle<Result<()>> = thread::Builder::new()
-            .name(format!(
-                "thrd-tantivy-index{}-gen{}",
-                self.worker_id, generation
-            ))
+        let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
+            .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
                 loop {
                     let mut document_iterator =
@@ -426,8 +436,7 @@ impl IndexWriter {
                     let segment = index.new_segment();
                     index_documents(
                         mem_budget,
-                        &segment,
-                        generation,
+                        segment,
                         &mut document_iterator,
                         &mut segment_updater,
                         delete_cursor.clone(),
@@ -444,22 +453,23 @@ impl IndexWriter {
         self.segment_updater.get_merge_policy()
     }
 
-    /// Set the merge policy.
+    /// Setter for the merge policy.
     pub fn set_merge_policy(&self, merge_policy: Box<dyn MergePolicy>) {
         self.segment_updater.set_merge_policy(merge_policy);
     }
 
-    fn start_workers(&mut self) -> Result<()> {
+    fn start_workers(&mut self) -> crate::Result<()> {
         for _ in 0..self.num_threads {
             self.add_indexing_worker()?;
         }
         Ok(())
     }
 
-    /// Detects and removes the files that
-    /// are not used by the index anymore.
-    pub fn garbage_collect_files(&mut self) -> Result<()> {
-        self.segment_updater.garbage_collect_files()
+    /// Detects and removes the files that are not used by the index anymore.
+    pub fn garbage_collect_files(
+        &self,
+    ) -> impl Future<Output = crate::Result<GarbageCollectionResult>> {
+        self.segment_updater.schedule_garbage_collect()
     }
 
     /// Deletes all documents from the index
@@ -469,12 +479,10 @@ impl IndexWriter {
     /// by clearing and resubmitting necessary documents
     ///
     /// ```rust
-    /// #[macro_use]
-    /// extern crate tantivy;
-    /// use tantivy::query::QueryParser;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::query::QueryParser;
     /// use tantivy::schema::*;
-    /// use tantivy::Index;
+    /// use tantivy::{doc, Index};
     ///
     /// fn main() -> tantivy::Result<()> {
     ///     let mut schema_builder = Schema::builder();
@@ -500,7 +508,7 @@ impl IndexWriter {
     ///     Ok(())
     /// }
     /// ```
-    pub fn delete_all_documents(&mut self) -> Result<Opstamp> {
+    pub fn delete_all_documents(&self) -> crate::Result<Opstamp> {
         // Delete segments
         self.segment_updater.remove_all_segments();
         // Return new stamp - reverted stamp
@@ -514,8 +522,10 @@ impl IndexWriter {
     pub fn merge(
         &mut self,
         segment_ids: &[SegmentId],
-    ) -> Result<impl Future<Item = SegmentMeta, Error = Canceled>> {
-        self.segment_updater.start_merge(segment_ids)
+    ) -> impl Future<Output = crate::Result<SegmentMeta>> {
+        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+        let segment_updater = self.segment_updater.clone();
+        async move { segment_updater.start_merge(merge_operation)?.await }
     }
 
     /// Closes the current document channel send.
@@ -541,13 +551,8 @@ impl IndexWriter {
     /// state as it was after the last commit.
     ///
     /// The opstamp at the last commit is returned.
-    pub fn rollback(&mut self) -> Result<Opstamp> {
+    pub fn rollback(&mut self) -> crate::Result<Opstamp> {
         info!("Rolling back to opstamp {}", self.committed_opstamp);
-        self.rollback_impl()
-    }
-
-    /// Private, implementation of rollback
-    fn rollback_impl(&mut self) -> Result<Opstamp> {
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
@@ -559,7 +564,7 @@ impl IndexWriter {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer: IndexWriter = open_index_writer(
+        let new_index_writer: IndexWriter = IndexWriter::new(
             &self.index,
             self.num_threads,
             self.heap_size_in_bytes_per_thread,
@@ -577,7 +582,7 @@ impl IndexWriter {
         //
         // This will reach an end as the only document_sender
         // was dropped with the index_writer.
-        for _ in document_receiver.clone() {}
+        for _ in document_receiver {}
 
         Ok(self.committed_opstamp)
     }
@@ -603,15 +608,15 @@ impl IndexWriter {
     /// It is also possible to add a payload to the `commit`
     /// using this API.
     /// See [`PreparedCommit::set_payload()`](PreparedCommit.html)
-    pub fn prepare_commit(&mut self) -> Result<PreparedCommit<'_>> {
+    pub fn prepare_commit(&mut self) -> crate::Result<PreparedCommit> {
         // Here, because we join all of the worker threads,
         // all of the segment update for this commit have been
         // sent.
         //
-        // No document belonging to the next generation have been
+        // No document belonging to the next commit have been
         // pushed too, because add_document can only happen
         // on this thread.
-
+        //
         // This will move uncommitted segments to the state of
         // committed segments.
         info!("Preparing commit");
@@ -627,7 +632,6 @@ impl IndexWriter {
                 .join()
                 .map_err(|e| TantivyError::ErrorInThread(format!("{:?}", e)))?;
             indexing_worker_result?;
-            // add a new worker for the next generation.
             self.add_indexing_worker()?;
         }
 
@@ -651,7 +655,7 @@ impl IndexWriter {
     /// Commit returns the `opstamp` of the last document
     /// that made it in the commit.
     ///
-    pub fn commit(&mut self) -> Result<Opstamp> {
+    pub fn commit(&mut self) -> crate::Result<Opstamp> {
         self.prepare_commit()?.commit()
     }
 
@@ -692,13 +696,10 @@ impl IndexWriter {
     /// The opstamp is an increasing `u64` that can
     /// be used by the client to align commits with its own
     /// document queue.
-    ///
-    /// Currently it represents the number of documents that
-    /// have been added since the creation of the index.
     pub fn add_document(&self, document: Document) -> Opstamp {
         let opstamp = self.stamper.stamp();
         let add_operation = AddOperation { opstamp, document };
-        let send_result = self.operation_sender.send(vec![add_operation]);
+        let send_result = self.operation_sender.send(smallvec![add_operation]);
         if let Err(e) = send_result {
             panic!("Failed to index document. Sending to indexing channel failed. This probably means all of the indexing threads have panicked. {:?}", e);
         }
@@ -745,7 +746,7 @@ impl IndexWriter {
         }
         let (batch_opstamp, stamps) = self.get_batch_opstamps(count);
 
-        let mut adds: Vec<AddOperation> = Vec::new();
+        let mut adds = OperationGroup::default();
 
         for (user_op, opstamp) in user_operations.into_iter().zip(stamps) {
             match user_op {
@@ -768,17 +769,26 @@ impl IndexWriter {
     }
 }
 
+impl Drop for IndexWriter {
+    fn drop(&mut self) {
+        self.segment_updater.kill();
+        self.drop_sender();
+        for work in self.workers_join_handle.drain(..) {
+            let _ = work.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::super::operation::UserOperation;
-    use super::initial_table_size;
     use crate::collector::TopDocs;
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::indexer::NoMergePolicy;
     use crate::query::TermQuery;
-    use crate::schema::{self, IndexRecordOption};
+    use crate::schema::{self, IndexRecordOption, STRING};
     use crate::Index;
     use crate::ReloadPolicy;
     use crate::Term;
@@ -796,6 +806,46 @@ mod tests {
         ];
         let batch_opstamp1 = index_writer.run(operations);
         assert_eq!(batch_opstamp1, 2u64);
+    }
+
+    #[test]
+    fn test_no_need_to_rewrite_delete_file_if_no_new_deletes() {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
+        index_writer.add_document(doc!(text_field => "hello1"));
+        index_writer.add_document(doc!(text_field => "hello2"));
+        assert!(index_writer.commit().is_ok());
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.segment_reader(0u32).num_deleted_docs(), 0);
+
+        index_writer.delete_term(Term::from_field_text(text_field, "hello1"));
+        assert!(index_writer.commit().is_ok());
+
+        assert!(reader.reload().is_ok());
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.segment_reader(0u32).num_deleted_docs(), 1);
+
+        let previous_delete_opstamp = index.load_metas().unwrap().segments[0].delete_opstamp();
+
+        // All docs containing hello1 have been already removed.
+        // We should not update the delete meta.
+        index_writer.delete_term(Term::from_field_text(text_field, "hello1"));
+        assert!(index_writer.commit().is_ok());
+
+        assert!(reader.reload().is_ok());
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.segment_reader(0u32).num_deleted_docs(), 1);
+
+        let after_delete_opstamp = index.load_metas().unwrap().segments[0].delete_opstamp();
+        assert_eq!(after_delete_opstamp, previous_delete_opstamp);
     }
 
     #[test]
@@ -892,7 +942,7 @@ mod tests {
         let index_writer = index.writer(3_000_000).unwrap();
         assert_eq!(
             format!("{:?}", index_writer.get_merge_policy()),
-            "LogMergePolicy { min_merge_size: 8, min_layer_size: 10000, \
+            "LogMergePolicy { min_merge_size: 8, max_merge_size: 10000000, min_layer_size: 10000, \
              level_log_size: 0.75 }"
         );
         let merge_policy = Box::new(NoMergePolicy::default());
@@ -1065,41 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hashmap_size() {
-        assert_eq!(initial_table_size(100_000), 11);
-        assert_eq!(initial_table_size(1_000_000), 14);
-        assert_eq!(initial_table_size(10_000_000), 17);
-        assert_eq!(initial_table_size(1_000_000_000), 19);
-    }
-
-    #[cfg(not(feature = "no_fail"))]
-    #[test]
-    fn test_write_commit_fails() {
-        use fail;
-        let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
-        let index = Index::create_in_ram(schema_builder.build());
-
-        let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-        for _ in 0..100 {
-            index_writer.add_document(doc!(text_field => "a"));
-        }
-        index_writer.commit().unwrap();
-        fail::cfg("RAMDirectory::atomic_write", "return(error_write_failed)").unwrap();
-        for _ in 0..100 {
-            index_writer.add_document(doc!(text_field => "b"));
-        }
-        assert!(index_writer.commit().is_err());
-        let num_docs_containing = |s: &str| {
-            let term_a = Term::from_field_text(text_field, s);
-            index.reader().unwrap().searcher().doc_freq(&term_a)
-        };
-        assert_eq!(num_docs_containing("a"), 100);
-        assert_eq!(num_docs_containing("b"), 0);
-        fail::cfg("RAMDirectory::atomic_write", "off").unwrap();
-    }
-
-    #[test]
     fn test_add_then_delete_all_documents() {
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text", schema::TEXT);
@@ -1239,4 +1254,15 @@ mod tests {
         assert!(commit_again.is_ok());
     }
 
+    #[test]
+    fn test_index_doc_missing_field() {
+        let mut schema_builder = schema::Schema::builder();
+        let idfield = schema_builder.add_text_field("id", STRING);
+        schema_builder.add_text_field("optfield", STRING);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
+        index_writer.add_document(doc!(idfield=>"myid"));
+        let commit = index_writer.commit();
+        assert!(commit.is_ok());
+    }
 }

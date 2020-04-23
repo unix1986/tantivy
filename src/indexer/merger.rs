@@ -21,9 +21,6 @@ use crate::store::StoreWriter;
 use crate::termdict::TermMerger;
 use crate::termdict::TermOrdinal;
 use crate::DocId;
-use crate::Result;
-use crate::TantivyError;
-use itertools::Itertools;
 use std::cmp;
 use std::collections::HashMap;
 
@@ -72,11 +69,11 @@ fn compute_min_max_val(
             Some(delete_bitset) => {
                 // some deleted documents,
                 // we need to recompute the max / min
-                (0..max_doc)
-                    .filter(|doc_id| delete_bitset.is_alive(*doc_id))
-                    .map(|doc_id| u64_reader.get(doc_id))
-                    .minmax()
-                    .into_option()
+                crate::common::minmax(
+                    (0..max_doc)
+                        .filter(|doc_id| delete_bitset.is_alive(*doc_id))
+                        .map(|doc_id| u64_reader.get(doc_id)),
+                )
             }
             None => {
                 // no deleted documents,
@@ -143,7 +140,7 @@ impl DeltaComputer {
 }
 
 impl IndexMerger {
-    pub fn open(schema: Schema, segments: &[Segment]) -> Result<IndexMerger> {
+    pub fn open(schema: Schema, segments: &[Segment]) -> crate::Result<IndexMerger> {
         let mut readers = vec![];
         let mut max_doc: u32 = 0u32;
         for segment in segments {
@@ -159,7 +156,7 @@ impl IndexMerger {
                  which exceeds the limit {}.",
                 max_doc, MAX_DOC_LIMIT
             );
-            return Err(TantivyError::InvalidArgument(err_msg));
+            return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
         Ok(IndexMerger {
             schema,
@@ -168,7 +165,10 @@ impl IndexMerger {
         })
     }
 
-    fn write_fieldnorms(&self, fieldnorms_serializer: &mut FieldNormsSerializer) -> Result<()> {
+    fn write_fieldnorms(
+        &self,
+        fieldnorms_serializer: &mut FieldNormsSerializer,
+    ) -> crate::Result<()> {
         let fields = FieldNormsWriter::fields_with_fieldnorm(&self.schema);
         let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
         for field in fields {
@@ -189,9 +189,8 @@ impl IndexMerger {
         &self,
         fast_field_serializer: &mut FastFieldSerializer,
         mut term_ord_mappings: HashMap<Field, TermOrdinalMapping>,
-    ) -> Result<()> {
-        for (field_id, field_entry) in self.schema.fields().iter().enumerate() {
-            let field = Field(field_id as u32);
+    ) -> crate::Result<()> {
+        for (field, field_entry) in self.schema.fields() {
             let field_type = field_entry.field_type();
             match *field_type {
                 FieldType::HierarchicalFacet => {
@@ -207,6 +206,7 @@ impl IndexMerger {
                 }
                 FieldType::U64(ref options)
                 | FieldType::I64(ref options)
+                | FieldType::F64(ref options)
                 | FieldType::Date(ref options) => match options.get_fastfield_cardinality() {
                     Some(Cardinality::SingleValue) => {
                         self.write_single_fast_field(field, fast_field_serializer)?;
@@ -234,7 +234,7 @@ impl IndexMerger {
         &self,
         field: Field,
         fast_field_serializer: &mut FastFieldSerializer,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         let mut u64_readers = vec![];
         let mut min_value = u64::max_value();
         let mut max_value = u64::min_value();
@@ -284,7 +284,7 @@ impl IndexMerger {
         &self,
         field: Field,
         fast_field_serializer: &mut FastFieldSerializer,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         let mut total_num_vals = 0u64;
         let mut u64s_readers: Vec<MultiValueIntFastFieldReader<u64>> = Vec::new();
 
@@ -331,7 +331,7 @@ impl IndexMerger {
         field: Field,
         term_ordinal_mappings: &TermOrdinalMapping,
         fast_field_serializer: &mut FastFieldSerializer,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         // Multifastfield consists in 2 fastfields.
         // The first serves as an index into the second one and is stricly increasing.
         // The second contains the actual values.
@@ -371,7 +371,7 @@ impl IndexMerger {
         &self,
         field: Field,
         fast_field_serializer: &mut FastFieldSerializer,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         // Multifastfield consists in 2 fastfields.
         // The first serves as an index into the second one and is stricly increasing.
         // The second contains the actual values.
@@ -436,7 +436,7 @@ impl IndexMerger {
         &self,
         field: Field,
         fast_field_serializer: &mut FastFieldSerializer,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         let mut total_num_vals = 0u64;
         let mut bytes_readers: Vec<BytesFastFieldReader> = Vec::new();
 
@@ -492,7 +492,7 @@ impl IndexMerger {
         indexed_field: Field,
         field_type: &FieldType,
         serializer: &mut InvertedIndexSerializer,
-    ) -> Result<Option<TermOrdinalMapping>> {
+    ) -> crate::Result<Option<TermOrdinalMapping>> {
         let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
         let mut delta_computer = DeltaComputer::new();
         let field_readers = self
@@ -646,24 +646,21 @@ impl IndexMerger {
     fn write_postings(
         &self,
         serializer: &mut InvertedIndexSerializer,
-    ) -> Result<HashMap<Field, TermOrdinalMapping>> {
+    ) -> crate::Result<HashMap<Field, TermOrdinalMapping>> {
         let mut term_ordinal_mappings = HashMap::new();
-        for (field_ord, field_entry) in self.schema.fields().iter().enumerate() {
+        for (field, field_entry) in self.schema.fields() {
             if field_entry.is_indexed() {
-                let indexed_field = Field(field_ord as u32);
-                if let Some(term_ordinal_mapping) = self.write_postings_for_field(
-                    indexed_field,
-                    field_entry.field_type(),
-                    serializer,
-                )? {
-                    term_ordinal_mappings.insert(indexed_field, term_ordinal_mapping);
+                if let Some(term_ordinal_mapping) =
+                    self.write_postings_for_field(field, field_entry.field_type(), serializer)?
+                {
+                    term_ordinal_mappings.insert(field, term_ordinal_mapping);
                 }
             }
         }
         Ok(term_ordinal_mappings)
     }
 
-    fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> Result<()> {
+    fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
         for reader in &self.readers {
             let store_reader = reader.get_store_reader();
             if reader.num_deleted_docs() > 0 {
@@ -680,7 +677,7 @@ impl IndexMerger {
 }
 
 impl SerializableSegment for IndexMerger {
-    fn write(&self, mut serializer: SegmentSerializer) -> Result<u32> {
+    fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
         let term_ord_mappings = self.write_postings(serializer.get_postings_serializer())?;
         self.write_fieldnorms(serializer.get_fieldnorms_serializer())?;
         self.write_fast_fields(serializer.get_fast_field_serializer(), term_ord_mappings)?;
@@ -692,7 +689,7 @@ impl SerializableSegment for IndexMerger {
 
 #[cfg(test)]
 mod tests {
-    use crate::collector::tests::TestCollector;
+    use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::collector::tests::{BytesFastFieldTestCollector, FastFieldTestCollector};
     use crate::collector::{Count, FacetCollector};
     use crate::core::Index;
@@ -712,7 +709,7 @@ mod tests {
     use crate::IndexWriter;
     use crate::Searcher;
     use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-    use futures::Future;
+    use futures::executor::block_on;
     use std::io::Cursor;
 
     #[test]
@@ -795,11 +792,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
+            block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
             index_writer.wait_merging_threads().unwrap();
         }
         {
@@ -807,7 +800,7 @@ mod tests {
             let searcher = reader.searcher();
             let get_doc_ids = |terms: Vec<Term>| {
                 let query = BooleanQuery::new_multiterms_query(terms);
-                let top_docs = searcher.search(&query, &TestCollector).unwrap();
+                let top_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
                 top_docs.docs().to_vec()
             };
             {
@@ -1043,11 +1036,7 @@ mod tests {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
+            block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
             reader.reload().unwrap();
             let searcher = reader.searcher();
             assert_eq!(searcher.segment_readers().len(), 1);
@@ -1142,11 +1131,7 @@ mod tests {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
+            block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
             reader.reload().unwrap();
 
             let searcher = reader.searcher();
@@ -1280,11 +1265,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
+            block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
             index_writer.wait_merging_threads().unwrap();
             reader.reload().unwrap();
             test_searcher(
@@ -1339,11 +1320,7 @@ mod tests {
         let segment_ids = index
             .searchable_segment_ids()
             .expect("Searchable segments failed.");
-        index_writer
-            .merge(&segment_ids)
-            .expect("Failed to initiate merge")
-            .wait()
-            .expect("Merging failed");
+        block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
         reader.reload().unwrap();
         // commit has not been called yet. The document should still be
         // there.
@@ -1364,22 +1341,18 @@ mod tests {
             let mut doc = Document::default();
             doc.add_u64(int_field, 1);
             index_writer.add_document(doc.clone());
-            index_writer.commit().expect("commit failed");
+            assert!(index_writer.commit().is_ok());
             index_writer.add_document(doc);
-            index_writer.commit().expect("commit failed");
+            assert!(index_writer.commit().is_ok());
             index_writer.delete_term(Term::from_field_u64(int_field, 1));
 
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
+            assert!(block_on(index_writer.merge(&segment_ids)).is_ok());
 
             // assert delete has not been committed
-            reader.reload().expect("failed to load searcher 1");
+            assert!(reader.reload().is_ok());
             let searcher = reader.searcher();
             assert_eq!(searcher.num_docs(), 2);
 
@@ -1418,12 +1391,12 @@ mod tests {
             index_doc(&mut index_writer, &[1, 5]);
             index_doc(&mut index_writer, &[3]);
             index_doc(&mut index_writer, &[17]);
-            index_writer.commit().expect("committed");
+            assert!(index_writer.commit().is_ok());
             index_doc(&mut index_writer, &[20]);
-            index_writer.commit().expect("committed");
+            assert!(index_writer.commit().is_ok());
             index_doc(&mut index_writer, &[28, 27]);
             index_doc(&mut index_writer, &[1_000]);
-            index_writer.commit().expect("committed");
+            assert!(index_writer.commit().is_ok());
         }
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -1455,15 +1428,6 @@ mod tests {
             assert_eq!(&vals, &[17]);
         }
 
-        println!(
-            "{:?}",
-            searcher
-                .segment_readers()
-                .iter()
-                .map(|reader| reader.max_doc())
-                .collect::<Vec<_>>()
-        );
-
         {
             let segment = searcher.segment_reader(1u32);
             let ff_reader = segment.fast_fields().u64s(int_field).unwrap();
@@ -1487,27 +1451,13 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-            index_writer
-                .merge(&segment_ids)
-                .expect("Failed to initiate merge")
-                .wait()
-                .expect("Merging failed");
-            index_writer
-                .wait_merging_threads()
-                .expect("Wait for merging threads");
+            assert!(block_on(index_writer.merge(&segment_ids)).is_ok());
+            assert!(index_writer.wait_merging_threads().is_ok());
         }
-        reader.reload().expect("Load searcher");
+        assert!(reader.reload().is_ok());
 
         {
             let searcher = reader.searcher();
-            println!(
-                "{:?}",
-                searcher
-                    .segment_readers()
-                    .iter()
-                    .map(|reader| reader.max_doc())
-                    .collect::<Vec<_>>()
-            );
             let segment = searcher.segment_reader(0u32);
             let ff_reader = segment.fast_fields().u64s(int_field).unwrap();
 
@@ -1541,5 +1491,47 @@ mod tests {
             ff_reader.get_vals(9, &mut vals);
             assert_eq!(&vals, &[20]);
         }
+    }
+
+    #[test]
+    fn merges_f64_fast_fields_correctly() -> crate::Result<()> {
+        let mut builder = schema::SchemaBuilder::new();
+
+        let fast_multi = IntOptions::default().set_fast(Cardinality::MultiValues);
+
+        let field = builder.add_f64_field("f64", schema::FAST);
+        let multi_field = builder.add_f64_field("f64s", fast_multi);
+
+        let index = Index::create_in_ram(builder.build());
+
+        let mut writer = index.writer_with_num_threads(1, 3_000_000)?;
+
+        // Make sure we'll attempt to merge every created segment
+        let mut policy = crate::indexer::LogMergePolicy::default();
+        policy.set_min_merge_size(2);
+        writer.set_merge_policy(Box::new(policy));
+
+        for i in 0..100 {
+            let mut doc = Document::new();
+            doc.add_f64(field, 42.0);
+
+            doc.add_f64(multi_field, 0.24);
+            doc.add_f64(multi_field, 0.27);
+
+            writer.add_document(doc);
+
+            if i % 5 == 0 {
+                writer.commit()?;
+            }
+        }
+
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+
+        // If a merging thread fails, we should end up with more
+        // than one segment here
+        assert_eq!(1, index.searchable_segments()?.len());
+
+        Ok(())
     }
 }

@@ -11,13 +11,11 @@
 
 // ---
 // Importing tantivy...
-#[macro_use]
-extern crate tantivy;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::tokenizer::*;
-use tantivy::Index;
+use tantivy::{doc, Index};
 
 fn main() -> tantivy::Result<()> {
     // this example assumes you understand the content in `basic_search`
@@ -52,7 +50,7 @@ fn main() -> tantivy::Result<()> {
 
     // This tokenizer lowers all of the text (to help with stop word matching)
     // then removes all instances of `the` and `and` from the corpus
-    let tokenizer = SimpleTokenizer
+    let tokenizer = TextAnalyzer::from(SimpleTokenizer)
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(vec![
             "the".to_string(),

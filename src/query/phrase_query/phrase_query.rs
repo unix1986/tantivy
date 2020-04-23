@@ -1,12 +1,10 @@
 use super::PhraseWeight;
 use crate::core::searcher::Searcher;
-use crate::error::TantivyError;
 use crate::query::bm25::BM25Weight;
 use crate::query::Query;
 use crate::query::Weight;
 use crate::schema::IndexRecordOption;
 use crate::schema::{Field, Term};
-use crate::Result;
 use std::collections::BTreeSet;
 
 /// `PhraseQuery` matches a specific sequence of words.
@@ -40,7 +38,7 @@ impl PhraseQuery {
         PhraseQuery::new_with_offset(terms_with_offset)
     }
 
-    /// Creates a new `PhraseQuery` given a list of terms and there offsets.
+    /// Creates a new `PhraseQuery` given a list of terms and their offsets.
     ///
     /// Can be used to provide custom offset for each term.
     pub fn new_with_offset(mut terms: Vec<(usize, Term)>) -> PhraseQuery {
@@ -72,13 +70,16 @@ impl PhraseQuery {
             .map(|(_, term)| term.clone())
             .collect::<Vec<Term>>()
     }
-}
 
-impl Query for PhraseQuery {
-    /// Create the weight associated to a query.
+    /// Returns the `PhraseWeight` for the given phrase query given a specific `searcher`.
     ///
-    /// See [`Weight`](./trait.Weight.html).
-    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> Result<Box<dyn Weight>> {
+    /// This function is the same as `.weight(...)` except it returns
+    /// a specialized type `PhraseWeight` instead of a Boxed trait.
+    pub(crate) fn phrase_weight(
+        &self,
+        searcher: &Searcher,
+        scoring_enabled: bool,
+    ) -> crate::Result<PhraseWeight> {
         let schema = searcher.schema();
         let field_entry = schema.get_field_entry(self.field);
         let has_positions = field_entry
@@ -88,16 +89,27 @@ impl Query for PhraseQuery {
             .unwrap_or(false);
         if !has_positions {
             let field_name = field_entry.name();
-            return Err(TantivyError::SchemaError(format!(
+            return Err(crate::TantivyError::SchemaError(format!(
                 "Applied phrase query on field {:?}, which does not have positions indexed",
                 field_name
             )));
         }
         let terms = self.phrase_terms();
         let bm25_weight = BM25Weight::for_terms(searcher, &terms);
+        Ok(PhraseWeight::new(
+            self.phrase_terms.clone(),
+            bm25_weight,
+            scoring_enabled,
+        ))
+    }
+}
 
-        let phrase_weight: PhraseWeight =
-            PhraseWeight::new(self.phrase_terms.clone(), bm25_weight, scoring_enabled);
+impl Query for PhraseQuery {
+    /// Create the weight associated to a query.
+    ///
+    /// See [`Weight`](./trait.Weight.html).
+    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> crate::Result<Box<dyn Weight>> {
+        let phrase_weight = self.phrase_weight(searcher, scoring_enabled)?;
         Ok(Box::new(phrase_weight))
     }
 

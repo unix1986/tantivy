@@ -11,7 +11,6 @@ use crate::schema::Schema;
 use crate::schema::{Field, FieldEntry, FieldType};
 use crate::termdict::{TermDictionaryBuilder, TermOrdinal};
 use crate::DocId;
-use crate::Result;
 use std::io::{self, Write};
 
 /// `InvertedIndexSerializer` is in charge of serializing
@@ -61,7 +60,7 @@ impl InvertedIndexSerializer {
         positions_write: CompositeWrite<WritePtr>,
         positionsidx_write: CompositeWrite<WritePtr>,
         schema: Schema,
-    ) -> Result<InvertedIndexSerializer> {
+    ) -> crate::Result<InvertedIndexSerializer> {
         Ok(InvertedIndexSerializer {
             terms_write,
             postings_write,
@@ -72,7 +71,7 @@ impl InvertedIndexSerializer {
     }
 
     /// Open a new `PostingsSerializer` for the given segment
-    pub fn open(segment: &mut Segment) -> Result<InvertedIndexSerializer> {
+    pub fn open(segment: &mut Segment) -> crate::Result<InvertedIndexSerializer> {
         use crate::SegmentComponent::{POSITIONS, POSITIONSSKIP, POSTINGS, TERMS};
         InvertedIndexSerializer::create(
             CompositeWrite::wrap(segment.open_write(TERMS)?),
@@ -141,18 +140,14 @@ impl<'a> FieldSerializer<'a> {
             FieldType::Str(ref text_options) => {
                 if let Some(text_indexing_options) = text_options.get_indexing_options() {
                     let index_option = text_indexing_options.index_option();
-                    (
-                        index_option.is_termfreq_enabled(),
-                        index_option.is_position_enabled(),
-                    )
+                    (index_option.has_freq(), index_option.has_positions())
                 } else {
                     (false, false)
                 }
             }
             _ => (false, false),
         };
-        let term_dictionary_builder =
-            TermDictionaryBuilder::create(term_dictionary_write, &field_type)?;
+        let term_dictionary_builder = TermDictionaryBuilder::create(term_dictionary_write)?;
         let postings_serializer =
             PostingsSerializer::new(postings_write, term_freq_enabled, position_enabled);
         let positions_serializer_opt = if position_enabled {

@@ -4,20 +4,36 @@ use crate::core::SerializableSegment;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::FieldNormsWriter;
 use crate::indexer::segment_serializer::SegmentSerializer;
+use crate::postings::compute_table_size;
 use crate::postings::MultiFieldPostingsWriter;
-use crate::schema::FieldEntry;
 use crate::schema::FieldType;
 use crate::schema::Schema;
 use crate::schema::Term;
 use crate::schema::Value;
-use crate::tokenizer::BoxedTokenizer;
-use crate::tokenizer::FacetTokenizer;
-use crate::tokenizer::{TokenStream, Tokenizer};
+use crate::schema::{Field, FieldEntry};
+use crate::tokenizer::{BoxTokenStream, PreTokenizedStream};
+use crate::tokenizer::{FacetTokenizer, TextAnalyzer};
+use crate::tokenizer::{TokenStreamChain, Tokenizer};
 use crate::DocId;
 use crate::Opstamp;
-use crate::Result;
 use std::io;
 use std::str;
+
+/// Computes the initial size of the hash table.
+///
+/// Returns a number of bit `b`, such that the recommended initial table size is 2^b.
+fn initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
+    let table_memory_upper_bound = per_thread_memory_budget / 3;
+    if let Some(limit) = (10..)
+        .take_while(|num_bits: &usize| compute_table_size(*num_bits) < table_memory_upper_bound)
+        .last()
+    {
+        Ok(limit.min(19)) // we cap it at 2^19 = 512K.
+    } else {
+        Err(crate::TantivyError::InvalidArgument(
+            format!("per thread memory budget (={}) is too small. Raise the memory budget or lower the number of threads.", per_thread_memory_budget)))
+    }
+}
 
 /// A `SegmentWriter` is in charge of creating segment index from a
 /// set of documents.
@@ -31,7 +47,7 @@ pub struct SegmentWriter {
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: FieldNormsWriter,
     doc_opstamps: Vec<Opstamp>,
-    tokenizers: Vec<Option<Box<dyn BoxedTokenizer>>>,
+    tokenizers: Vec<Option<TextAnalyzer>>,
 }
 
 impl SegmentWriter {
@@ -45,18 +61,17 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(
-        table_bits: usize,
+        memory_budget: usize,
         mut segment: Segment,
         schema: &Schema,
-    ) -> Result<SegmentWriter> {
+    ) -> crate::Result<SegmentWriter> {
+        let table_num_bits = initial_table_size(memory_budget)?;
         let segment_serializer = SegmentSerializer::for_segment(&mut segment)?;
-        let multifield_postings = MultiFieldPostingsWriter::new(schema, table_bits);
-        let tokenizers =
-            schema
-                .fields()
-                .iter()
-                .map(FieldEntry::field_type)
-                .map(|field_type| match *field_type {
+        let multifield_postings = MultiFieldPostingsWriter::new(schema, table_num_bits);
+        let tokenizers = schema
+            .fields()
+            .map(
+                |(_, field_entry): (Field, &FieldEntry)| match field_entry.field_type() {
                     FieldType::Str(ref text_options) => text_options
                         .get_indexing_options()
                         .and_then(|text_index_option| {
@@ -64,8 +79,9 @@ impl SegmentWriter {
                             segment.index().tokenizers().get(tokenizer_name)
                         }),
                     _ => None,
-                })
-                .collect();
+                },
+            )
+            .collect();
         Ok(SegmentWriter {
             max_doc: 0,
             multifield_postings,
@@ -81,7 +97,7 @@ impl SegmentWriter {
     ///
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
-    pub fn finalize(mut self) -> Result<Vec<u64>> {
+    pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
         write(
             &self.multifield_postings,
@@ -140,26 +156,43 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Str(_) => {
-                    let num_tokens = if let Some(ref mut tokenizer) =
-                        self.tokenizers[field.0 as usize]
-                    {
-                        let texts: Vec<&str> = field_values
-                            .iter()
-                            .flat_map(|field_value| match *field_value.value() {
-                                Value::Str(ref text) => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if texts.is_empty() {
-                            0
-                        } else {
-                            let mut token_stream = tokenizer.token_stream_texts(&texts[..]);
-                            self.multifield_postings
-                                .index_text(doc_id, field, &mut token_stream)
+                    let mut token_streams: Vec<BoxTokenStream> = vec![];
+                    let mut offsets = vec![];
+                    let mut total_offset = 0;
+
+                    for field_value in field_values {
+                        match field_value.value() {
+                            Value::PreTokStr(tok_str) => {
+                                offsets.push(total_offset);
+                                if let Some(last_token) = tok_str.tokens.last() {
+                                    total_offset += last_token.offset_to;
+                                }
+
+                                token_streams
+                                    .push(PreTokenizedStream::from(tok_str.clone()).into());
+                            }
+                            Value::Str(ref text) => {
+                                if let Some(ref mut tokenizer) =
+                                    self.tokenizers[field.field_id() as usize]
+                                {
+                                    offsets.push(total_offset);
+                                    total_offset += text.len();
+
+                                    token_streams.push(tokenizer.token_stream(text));
+                                }
+                            }
+                            _ => (),
                         }
-                    } else {
+                    }
+
+                    let num_tokens = if token_streams.is_empty() {
                         0
+                    } else {
+                        let mut token_stream = TokenStreamChain::new(offsets, token_streams);
+                        self.multifield_postings
+                            .index_text(doc_id, field, &mut token_stream)
                     };
+
                     self.fieldnorms_writer.record(doc_id, field, num_tokens);
                 }
                 FieldType::U64(ref int_option) => {
@@ -195,12 +228,24 @@ impl SegmentWriter {
                         }
                     }
                 }
+                FieldType::F64(ref int_option) => {
+                    if int_option.is_indexed() {
+                        for field_value in field_values {
+                            let term = Term::from_field_f64(
+                                field_value.field(),
+                                field_value.value().f64_value(),
+                            );
+                            self.multifield_postings.subscribe(doc_id, &term);
+                        }
+                    }
+                }
                 FieldType::Bytes => {
                     // Do nothing. Bytes only supports fast fields.
                 }
             }
         }
         doc.filter_fields(|field| schema.get_field_entry(field).is_stored());
+        doc.prepare_for_store();
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&doc)?;
         self.max_doc += 1;
@@ -234,7 +279,7 @@ fn write(
     fast_field_writers: &FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
-) -> Result<()> {
+) -> crate::Result<()> {
     let term_ord_map = multifield_postings.serialize(serializer.get_postings_serializer())?;
     fast_field_writers.serialize(serializer.get_fast_field_serializer(), &term_ord_map)?;
     fieldnorms_writer.serialize(serializer.get_fieldnorms_serializer())?;
@@ -243,7 +288,7 @@ fn write(
 }
 
 impl SerializableSegment for SegmentWriter {
-    fn write(&self, serializer: SegmentSerializer) -> Result<u32> {
+    fn write(&self, serializer: SegmentSerializer) -> crate::Result<u32> {
         let max_doc = self.max_doc;
         write(
             &self.multifield_postings,
@@ -252,5 +297,18 @@ impl SerializableSegment for SegmentWriter {
             serializer,
         )?;
         Ok(max_doc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_table_size;
+
+    #[test]
+    fn test_hashmap_size() {
+        assert_eq!(initial_table_size(100_000).unwrap(), 11);
+        assert_eq!(initial_table_size(1_000_000).unwrap(), 14);
+        assert_eq!(initial_table_size(10_000_000).unwrap(), 17);
+        assert_eq!(initial_table_size(1_000_000_000).unwrap(), 19);
     }
 }

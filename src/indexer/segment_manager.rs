@@ -1,14 +1,11 @@
 use super::segment_register::SegmentRegister;
 use crate::core::SegmentId;
 use crate::core::SegmentMeta;
-use crate::core::META_FILEPATH;
 use crate::error::TantivyError;
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::SegmentEntry;
-use crate::Result as TantivyResult;
 use std::collections::hash_set::HashSet;
 use std::fmt::{self, Debug, Formatter};
-use std::path::PathBuf;
 use std::sync::RwLock;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
@@ -16,6 +13,28 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 struct SegmentRegisters {
     uncommitted: SegmentRegister,
     committed: SegmentRegister,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum SegmentsStatus {
+    Committed,
+    Uncommitted,
+}
+
+impl SegmentRegisters {
+    /// Check if all the segments are committed or uncommited.
+    ///
+    /// If some segment is missing or segments are in a different state (this should not happen
+    /// if tantivy is used correctly), returns `None`.
+    fn segments_status(&self, segment_ids: &[SegmentId]) -> Option<SegmentsStatus> {
+        if self.uncommitted.contains_all(segment_ids) {
+            Some(SegmentsStatus::Uncommitted)
+        } else if self.committed.contains_all(segment_ids) {
+            Some(SegmentsStatus::Committed)
+        } else {
+            None
+        }
+    }
 }
 
 /// The segment manager stores the list of segments
@@ -29,7 +48,7 @@ pub struct SegmentManager {
 }
 
 impl Debug for SegmentManager {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let lock = self.read();
         write!(
             f,
@@ -73,19 +92,6 @@ impl SegmentManager {
         let mut segment_entries = registers_lock.uncommitted.segment_entries();
         segment_entries.extend(registers_lock.committed.segment_entries());
         segment_entries
-    }
-
-    /// List the files that are useful to the index.
-    ///
-    /// This does not include lock files, or files that are obsolete
-    /// but have not yet been deleted by the garbage collector.
-    pub fn list_files(&self) -> HashSet<PathBuf> {
-        let mut files = HashSet::new();
-        files.insert(META_FILEPATH.to_path_buf());
-        for segment_meta in SegmentMeta::all() {
-            files.extend(segment_meta.list_files());
-        }
-        files
     }
 
     // Lock poisoning should never happen :
@@ -138,7 +144,7 @@ impl SegmentManager {
     /// Returns an error if some segments are missing, or if
     /// the `segment_ids` are not either all committed or all
     /// uncommitted.
-    pub fn start_merge(&self, segment_ids: &[SegmentId]) -> TantivyResult<Vec<SegmentEntry>> {
+    pub fn start_merge(&self, segment_ids: &[SegmentId]) -> crate::Result<Vec<SegmentEntry>> {
         let registers_lock = self.read();
         let mut segment_entries = vec![];
         if registers_lock.uncommitted.contains_all(segment_ids) {
@@ -168,33 +174,35 @@ impl SegmentManager {
         let mut registers_lock = self.write();
         registers_lock.uncommitted.add_segment_entry(segment_entry);
     }
-
-    pub fn end_merge(
+    // Replace a list of segments for their equivalent merged segment.
+    //
+    // Returns true if these segments are committed, false if the merge segments are uncommited.
+    pub(crate) fn end_merge(
         &self,
         before_merge_segment_ids: &[SegmentId],
         after_merge_segment_entry: SegmentEntry,
-    ) {
+    ) -> crate::Result<SegmentsStatus> {
         let mut registers_lock = self.write();
-        let target_register: &mut SegmentRegister = {
-            if registers_lock
-                .uncommitted
-                .contains_all(before_merge_segment_ids)
-            {
-                &mut registers_lock.uncommitted
-            } else if registers_lock
-                .committed
-                .contains_all(before_merge_segment_ids)
-            {
-                &mut registers_lock.committed
-            } else {
+        let segments_status = registers_lock
+            .segments_status(before_merge_segment_ids)
+            .ok_or_else(|| {
                 warn!("couldn't find segment in SegmentManager");
-                return;
-            }
+                crate::TantivyError::InvalidArgument(
+                    "The segments that were merged could not be found in the SegmentManager. \
+                     This is not necessarily a bug, and can happen after a rollback for instance."
+                        .to_string(),
+                )
+            })?;
+
+        let target_register: &mut SegmentRegister = match segments_status {
+            SegmentsStatus::Uncommitted => &mut registers_lock.uncommitted,
+            SegmentsStatus::Committed => &mut registers_lock.committed,
         };
         for segment_id in before_merge_segment_ids {
             target_register.remove_segment(segment_id);
         }
         target_register.add_segment_entry(after_merge_segment_entry);
+        Ok(segments_status)
     }
 
     pub fn committed_segment_metas(&self) -> Vec<SegmentMeta> {

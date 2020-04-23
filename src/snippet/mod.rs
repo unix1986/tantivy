@@ -1,10 +1,8 @@
 use crate::query::Query;
 use crate::schema::Field;
 use crate::schema::Value;
-use crate::tokenizer::BoxedTokenizer;
-use crate::tokenizer::{Token, TokenStream};
+use crate::tokenizer::{TextAnalyzer, Token};
 use crate::Document;
-use crate::Result;
 use crate::Searcher;
 use htmlescape::encode_minimal;
 use std::cmp::Ordering;
@@ -63,7 +61,7 @@ impl FragmentCandidate {
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, f32>) {
         self.stop_offset = token.offset_to;
 
-        if let Some(score) = terms.get(&token.text.to_lowercase()) {
+        if let Some(&score) = terms.get(&token.text.to_lowercase()) {
             self.score += score;
             self.highlighted
                 .push(HighlightSection::new(token.offset_from, token.offset_to));
@@ -142,7 +140,7 @@ impl Snippet {
 /// Fragments must be valid in the sense that `&text[fragment.start..fragment.stop]`\
 /// has to be a valid string.
 fn search_fragments<'a>(
-    tokenizer: &dyn BoxedTokenizer,
+    tokenizer: &TextAnalyzer,
     text: &'a str,
     terms: &BTreeMap<String, f32>,
     max_num_chars: usize,
@@ -150,7 +148,6 @@ fn search_fragments<'a>(
     let mut token_stream = tokenizer.token_stream(text);
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
-
     while let Some(next) = token_stream.next() {
         if (next.offset_to - fragment.start_offset) > max_num_chars {
             if fragment.score > 0.0 {
@@ -214,11 +211,9 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
 /// # Example
 ///
 /// ```rust
-/// # #[macro_use]
-/// # extern crate tantivy;
-/// # use tantivy::Index;
-/// # use tantivy::schema::{Schema, TEXT};
 /// # use tantivy::query::QueryParser;
+/// # use tantivy::schema::{Schema, TEXT};
+/// # use tantivy::{doc, Index};
 /// use tantivy::SnippetGenerator;
 ///
 /// # fn main() -> tantivy::Result<()> {
@@ -254,7 +249,7 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
 /// ```
 pub struct SnippetGenerator {
     terms_text: BTreeMap<String, f32>,
-    tokenizer: Box<dyn BoxedTokenizer>,
+    tokenizer: TextAnalyzer,
     field: Field,
     max_num_chars: usize,
 }
@@ -265,7 +260,7 @@ impl SnippetGenerator {
         searcher: &Searcher,
         query: &dyn Query,
         field: Field,
-    ) -> Result<SnippetGenerator> {
+    ) -> crate::Result<SnippetGenerator> {
         let mut terms = BTreeSet::new();
         query.query_terms(&mut terms);
         let terms_text: BTreeMap<String, f32> = terms
@@ -316,12 +311,8 @@ impl SnippetGenerator {
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
-        let fragment_candidates = search_fragments(
-            &*self.tokenizer,
-            &text,
-            &self.terms_text,
-            self.max_num_chars,
-        );
+        let fragment_candidates =
+            search_fragments(&self.tokenizer, &text, &self.terms_text, self.max_num_chars);
         select_best_fragment_combination(&fragment_candidates[..], &text)
     }
 }
@@ -331,16 +322,15 @@ mod tests {
     use super::{search_fragments, select_best_fragment_combination};
     use crate::query::QueryParser;
     use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, TEXT};
-    use crate::tokenizer::{box_tokenizer, SimpleTokenizer};
+    use crate::tokenizer::SimpleTokenizer;
     use crate::Index;
     use crate::SnippetGenerator;
     use maplit::btreemap;
     use std::collections::BTreeMap;
     use std::iter::Iterator;
 
-    const TEST_TEXT: &'static str =
-        r#"Rust is a systems programming language sponsored by Mozilla which
-describes it as a "safe, concurrent, practical language", supporting functional and
+    const TEST_TEXT: &'static str = r#"Rust is a systems programming language sponsored by
+Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
 imperative-procedural paradigms. Rust is syntactically similar to C++[according to whom?],
 but its designers intend it to provide better memory safety while still maintaining
 performance.
@@ -355,12 +345,11 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
         let terms = btreemap! {
             String::from("rust") => 1.0,
             String::from("language") => 0.9
         };
-        let fragments = search_fragments(&*boxed_tokenizer, TEST_TEXT, &terms, 100);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 100);
         assert_eq!(fragments.len(), 7);
         {
             let first = &fragments[0];
@@ -370,25 +359,24 @@ Survey in 2016, 2017, and 2018."#;
         let snippet = select_best_fragment_combination(&fragments[..], &TEST_TEXT);
         assert_eq!(
             snippet.fragments,
-            "Rust is a systems programming language sponsored by \
-             Mozilla which\ndescribes it as a \"safe"
+            "Rust is a systems programming language sponsored by\n\
+             Mozilla which describes it as a \"safe"
         );
         assert_eq!(
             snippet.to_html(),
             "<b>Rust</b> is a systems programming <b>language</b> \
-             sponsored by Mozilla which\ndescribes it as a &quot;safe"
+             sponsored by\nMozilla which describes it as a &quot;safe"
         )
     }
 
     #[test]
     fn test_snippet_scored_fragment() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
         {
             let terms = btreemap! {
                 String::from("rust") =>1.0f32,
                 String::from("language") => 0.9f32
             };
-            let fragments = search_fragments(&*boxed_tokenizer, TEST_TEXT, &terms, 20);
+            let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 20);
             {
                 let first = &fragments[0];
                 assert_eq!(first.score, 1.0);
@@ -397,13 +385,12 @@ Survey in 2016, 2017, and 2018."#;
             let snippet = select_best_fragment_combination(&fragments[..], &TEST_TEXT);
             assert_eq!(snippet.to_html(), "<b>Rust</b> is a systems")
         }
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
         {
             let terms = btreemap! {
                 String::from("rust") =>0.9f32,
                 String::from("language") => 1.0f32
             };
-            let fragments = search_fragments(&*boxed_tokenizer, TEST_TEXT, &terms, 20);
+            let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 20);
             //assert_eq!(fragments.len(), 7);
             {
                 let first = &fragments[0];
@@ -417,14 +404,12 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_in_second_fragment() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
-
         let text = "a b c d e f g";
 
         let mut terms = BTreeMap::new();
         terms.insert(String::from("c"), 1.0);
 
-        let fragments = search_fragments(&*boxed_tokenizer, &text, &terms, 3);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), &text, &terms, 3);
 
         assert_eq!(fragments.len(), 1);
         {
@@ -441,14 +426,12 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_with_term_at_the_end_of_fragment() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
-
         let text = "a b c d e f f g";
 
         let mut terms = BTreeMap::new();
         terms.insert(String::from("f"), 1.0);
 
-        let fragments = search_fragments(&*boxed_tokenizer, &text, &terms, 3);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), &text, &terms, 3);
 
         assert_eq!(fragments.len(), 2);
         {
@@ -465,15 +448,13 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_with_second_fragment_has_the_highest_score() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
-
         let text = "a b c d e f g";
 
         let mut terms = BTreeMap::new();
         terms.insert(String::from("f"), 1.0);
         terms.insert(String::from("a"), 0.9);
 
-        let fragments = search_fragments(&*boxed_tokenizer, &text, &terms, 7);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), &text, &terms, 7);
 
         assert_eq!(fragments.len(), 2);
         {
@@ -490,14 +471,12 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_with_term_not_in_text() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
-
         let text = "a b c d";
 
         let mut terms = BTreeMap::new();
         terms.insert(String::from("z"), 1.0);
 
-        let fragments = search_fragments(&*boxed_tokenizer, &text, &terms, 3);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), &text, &terms, 3);
 
         assert_eq!(fragments.len(), 0);
 
@@ -508,12 +487,10 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_with_no_terms() {
-        let boxed_tokenizer = box_tokenizer(SimpleTokenizer);
-
         let text = "a b c d";
 
         let terms = BTreeMap::new();
-        let fragments = search_fragments(&*boxed_tokenizer, &text, &terms, 3);
+        let fragments = search_fragments(&From::from(SimpleTokenizer), &text, &terms, 3);
         assert_eq!(fragments.len(), 0);
 
         let snippet = select_best_fragment_combination(&fragments[..], &text);

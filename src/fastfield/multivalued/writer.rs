@@ -5,8 +5,7 @@ use crate::postings::UnorderedTermId;
 use crate::schema::{Document, Field};
 use crate::termdict::TermOrdinal;
 use crate::DocId;
-use itertools::Itertools;
-use std::collections::HashMap;
+use fnv::FnvHashMap;
 use std::io;
 
 /// Writer for multi-valued (as in, more than one value per document)
@@ -102,7 +101,7 @@ impl MultiValueIntFastFieldWriter {
     pub fn serialize(
         &self,
         serializer: &mut FastFieldSerializer,
-        mapping_opt: Option<&HashMap<UnorderedTermId, TermOrdinal>>,
+        mapping_opt: Option<&FnvHashMap<UnorderedTermId, TermOrdinal>>,
     ) -> io::Result<()> {
         {
             // writing the offset index
@@ -151,8 +150,8 @@ impl MultiValueIntFastFieldWriter {
                     }
                 }
                 None => {
-                    let val_min_max = self.vals.iter().cloned().minmax();
-                    let (val_min, val_max) = val_min_max.into_option().unwrap_or((0u64, 0u64));
+                    let val_min_max = crate::common::minmax(self.vals.iter().cloned());
+                    let (val_min, val_max) = val_min_max.unwrap_or((0u64, 0u64));
                     value_serializer =
                         serializer.new_u64_fast_field_with_idx(self.field, val_min, val_max, 1)?;
                     for &val in &self.vals {

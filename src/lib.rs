@@ -3,7 +3,6 @@
 #![cfg_attr(feature = "cargo-clippy", allow(clippy::module_inception))]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
 #![warn(missing_docs)]
-#![recursion_limit = "80"]
 
 //! # `tantivy`
 //!
@@ -11,26 +10,17 @@
 //! Think `Lucene`, but in Rust.
 //!
 //! ```rust
-
-//! # extern crate tempdir;
-//! #
-//! #[macro_use]
-//! extern crate tantivy;
-//!
-//! // ...
-//!
 //! # use std::path::Path;
-//! # use tempdir::TempDir;
-//! # use tantivy::Index;
-//! # use tantivy::schema::*;
-//! # use tantivy::{Score, DocAddress};
+//! # use tempfile::TempDir;
 //! # use tantivy::collector::TopDocs;
 //! # use tantivy::query::QueryParser;
+//! # use tantivy::schema::*;
+//! # use tantivy::{doc, DocAddress, Index, Score};
 //! #
 //! # fn main() {
 //! #     // Let's create a temporary directory for the
 //! #     // sake of this example
-//! #     if let Ok(dir) = TempDir::new("tantivy_example_dir") {
+//! #     if let Ok(dir) = TempDir::new() {
 //! #         run_example(dir.path()).unwrap();
 //! #         dir.close().unwrap();
 //! #     }
@@ -105,11 +95,8 @@
 //!
 //! A good place for you to get started is to check out
 //! the example code (
-//! [literate programming](http://fulmicoton.com/tantivy-examples/simple_search.html) /
-//! [source code](https://github.com/fulmicoton/tantivy/blob/master/examples/simple_search.rs))
-
-#[macro_use]
-extern crate serde_derive;
+//! [literate programming](https://tantivy-search.github.io/examples/basic_search.html) /
+//! [source code](https://github.com/tantivy-search/tantivy/blob/master/examples/basic_search.rs))
 
 #[cfg_attr(test, macro_use)]
 extern crate serde_json;
@@ -131,13 +118,13 @@ mod functional_test;
 mod macros;
 
 pub use crate::error::TantivyError;
-
-#[deprecated(since = "0.7.0", note = "please use `tantivy::TantivyError` instead")]
-pub use crate::error::TantivyError as Error;
 pub use chrono;
 
 /// Tantivy result.
-pub type Result<T> = std::result::Result<T, error::TantivyError>;
+///
+/// Within tantivy, please avoid importing `Result` using `use crate::Result`
+/// and instead, refer to this as `crate::Result<T>`.
+pub type Result<T> = std::result::Result<T, TantivyError>;
 
 /// Tantivy DateTime
 pub type DateTime = chrono::DateTime<chrono::Utc>;
@@ -170,21 +157,69 @@ pub use self::snippet::{Snippet, SnippetGenerator};
 
 mod docset;
 pub use self::docset::{DocSet, SkipResult};
-
-pub use crate::core::SegmentComponent;
+pub use crate::common::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64};
+pub use crate::core::{Executor, SegmentComponent};
 pub use crate::core::{Index, IndexMeta, Searcher, Segment, SegmentId, SegmentMeta};
 pub use crate::core::{InvertedIndexReader, SegmentReader};
 pub use crate::directory::Directory;
+pub use crate::indexer::operation::UserOperation;
 pub use crate::indexer::IndexWriter;
 pub use crate::postings::Postings;
+pub use crate::reader::LeasedItem;
 pub use crate::schema::{Document, Term};
+use std::fmt;
 
-pub use crate::common::{i64_to_u64, u64_to_i64};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 
-/// Expose the current version of tantivy, as well
-/// whether it was compiled with the simd compression.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+/// Index format version.
+const INDEX_FORMAT_VERSION: u32 = 1;
+
+/// Structure version for the index.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    index_format_version: u32,
+    store_compression: String,
+}
+
+impl fmt::Debug for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
+}
+
+static VERSION: Lazy<Version> = Lazy::new(|| Version {
+    major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+    minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
+    patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
+    index_format_version: INDEX_FORMAT_VERSION,
+    store_compression: crate::store::COMPRESSION.to_string(),
+});
+
+impl ToString for Version {
+    fn to_string(&self) -> String {
+        format!(
+            "tantivy v{}.{}.{}, index_format v{}, store_compression: {}",
+            self.major, self.minor, self.patch, self.index_format_version, self.store_compression
+        )
+    }
+}
+
+static VERSION_STRING: Lazy<String> = Lazy::new(|| VERSION.to_string());
+
+/// Expose the current version of tantivy as found in Cargo.toml during compilation.
+/// eg. "0.11.0" as well as the compression scheme used in the docstore.
+pub fn version() -> &'static Version {
+    &VERSION
+}
+
+/// Exposes the complete version of tantivy as found in Cargo.toml during compilation as a string.
+/// eg. "tantivy v0.11.0, index_format v1, store_compression: lz4".
+pub fn version_string() -> &'static str {
+    VERSION_STRING.as_str()
 }
 
 /// Defines tantivy's merging strategy
@@ -222,15 +257,13 @@ pub type Score = f32;
 pub type SegmentLocalId = u32;
 
 impl DocAddress {
-    /// Return the segment ordinal.
-    /// The segment ordinal is an id identifying the segment
-    /// hosting the document. It is only meaningful, in the context
-    /// of a searcher.
+    /// Return the segment ordinal id that identifies the segment
+    /// hosting the document in the `Searcher` it is called from.
     pub fn segment_ord(self) -> SegmentLocalId {
         self.0
     }
 
-    /// Return the segment local `DocId`
+    /// Return the segment-local `DocId`
     pub fn doc(self) -> DocId {
         self.1
     }
@@ -239,18 +272,18 @@ impl DocAddress {
 /// `DocAddress` contains all the necessary information
 /// to identify a document given a `Searcher` object.
 ///
-/// It consists in an id identifying its segment, and
-/// its segment-local `DocId`.
+/// It consists of an id identifying its segment, and
+/// a segment-local `DocId`.
 ///
 /// The id used for the segment is actually an ordinal
-/// in the list of segment hold by a `Searcher`.
+/// in the list of `Segment`s held by a `Searcher`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DocAddress(pub SegmentLocalId, pub DocId);
 
 #[cfg(test)]
 mod tests {
 
-    use crate::collector::tests::TestCollector;
+    use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::core::SegmentReader;
     use crate::docset::DocSet;
     use crate::query::BooleanQuery;
@@ -297,6 +330,18 @@ mod tests {
 
     pub fn sample(n: u32, ratio: f64) -> Vec<u32> {
         sample_with_seed(n, ratio, 4)
+    }
+
+    #[test]
+    #[cfg(not(feature = "lz4"))]
+    fn test_version_string() {
+        use regex::Regex;
+        let regex_ptn = Regex::new(
+            "tantivy v[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.{0,10}, index_format v[0-9]{1,5}",
+        )
+        .unwrap();
+        let version = super::version().to_string();
+        assert!(regex_ptn.find(&version).is_some());
     }
 
     #[test]
@@ -626,6 +671,30 @@ mod tests {
     }
 
     #[test]
+    fn test_indexed_f64() {
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_f64_field("value", INDEXED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
+        let val = std::f64::consts::PI;
+        index_writer.add_document(doc!(value_field => val));
+        index_writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let term = Term::from_field_f64(value_field, val);
+        let mut postings = searcher
+            .segment_reader(0)
+            .inverted_index(term.field())
+            .read_postings(&term, IndexRecordOption::Basic)
+            .unwrap();
+        assert!(postings.advance());
+        assert_eq!(postings.doc(), 0);
+        assert!(!postings.advance());
+    }
+
+    #[test]
     fn test_indexedfield_not_in_documents() {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -737,7 +806,7 @@ mod tests {
             let searcher = reader.searcher();
             let get_doc_ids = |terms: Vec<Term>| {
                 let query = BooleanQuery::new_multiterms_query(terms);
-                let topdocs = searcher.search(&query, &TestCollector).unwrap();
+                let topdocs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
                 topdocs.docs().to_vec()
             };
             assert_eq!(
@@ -817,6 +886,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let fast_field_unsigned = schema_builder.add_u64_field("unsigned", FAST);
         let fast_field_signed = schema_builder.add_i64_field("signed", FAST);
+        let fast_field_float = schema_builder.add_f64_field("float", FAST);
         let text_field = schema_builder.add_text_field("text", TEXT);
         let stored_int_field = schema_builder.add_u64_field("text", STORED);
         let schema = schema_builder.build();
@@ -824,7 +894,8 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
         {
-            let document = doc!(fast_field_unsigned => 4u64, fast_field_signed=>4i64);
+            let document =
+                doc!(fast_field_unsigned => 4u64, fast_field_signed=>4i64, fast_field_float=>4f64);
             index_writer.add_document(document);
             index_writer.commit().unwrap();
         }
@@ -844,10 +915,14 @@ mod tests {
             assert!(fast_field_reader_opt.is_none());
         }
         {
-            let fast_field_reader_opt = segment_reader.fast_fields().i64(fast_field_signed);
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(fast_field_float);
+            assert!(fast_field_reader_opt.is_none());
+        }
+        {
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(fast_field_unsigned);
             assert!(fast_field_reader_opt.is_some());
             let fast_field_reader = fast_field_reader_opt.unwrap();
-            assert_eq!(fast_field_reader.get(0), 4i64)
+            assert_eq!(fast_field_reader.get(0), 4u64)
         }
 
         {
@@ -856,5 +931,81 @@ mod tests {
             let fast_field_reader = fast_field_reader_opt.unwrap();
             assert_eq!(fast_field_reader.get(0), 4i64)
         }
+
+        {
+            let fast_field_reader_opt = segment_reader.fast_fields().f64(fast_field_float);
+            assert!(fast_field_reader_opt.is_some());
+            let fast_field_reader = fast_field_reader_opt.unwrap();
+            assert_eq!(fast_field_reader.get(0), 4f64)
+        }
+    }
+
+    // motivated by #729
+    #[test]
+    fn test_update_via_delete_insert() {
+        use crate::collector::Count;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::AllQuery;
+        use crate::SegmentId;
+        use futures::executor::block_on;
+
+        const DOC_COUNT: u64 = 2u64;
+
+        let mut schema_builder = SchemaBuilder::default();
+        let id = schema_builder.add_u64_field("id", INDEXED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema.clone());
+        let index_reader = index.reader().unwrap();
+
+        let mut index_writer = index.writer(3_000_000).unwrap();
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        for doc_id in 0u64..DOC_COUNT {
+            index_writer.add_document(doc!(id => doc_id));
+        }
+        index_writer.commit().unwrap();
+
+        index_reader.reload().unwrap();
+        let searcher = index_reader.searcher();
+
+        assert_eq!(
+            searcher.search(&AllQuery, &Count).unwrap(),
+            DOC_COUNT as usize
+        );
+
+        // update the 10 elements by deleting and re-adding
+        for doc_id in 0u64..DOC_COUNT {
+            index_writer.delete_term(Term::from_field_u64(id, doc_id));
+            index_writer.commit().unwrap();
+            index_reader.reload().unwrap();
+            let doc = doc!(id =>  doc_id);
+            index_writer.add_document(doc);
+            index_writer.commit().unwrap();
+            index_reader.reload().unwrap();
+            let searcher = index_reader.searcher();
+            // The number of document should be stable.
+            assert_eq!(
+                searcher.search(&AllQuery, &Count).unwrap(),
+                DOC_COUNT as usize
+            );
+        }
+
+        index_reader.reload().unwrap();
+        let searcher = index_reader.searcher();
+        let segment_ids: Vec<SegmentId> = searcher
+            .segment_readers()
+            .into_iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        block_on(index_writer.merge(&segment_ids)).unwrap();
+
+        index_reader.reload().unwrap();
+        let searcher = index_reader.searcher();
+
+        assert_eq!(
+            searcher.search(&AllQuery, &Count).unwrap(),
+            DOC_COUNT as usize
+        );
     }
 }

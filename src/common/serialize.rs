@@ -102,6 +102,19 @@ impl FixedSize for i64 {
     const SIZE_IN_BYTES: usize = 8;
 }
 
+impl BinarySerializable for f64 {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_f64::<Endianness>(*self)
+    }
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        reader.read_f64::<Endianness>()
+    }
+}
+
+impl FixedSize for f64 {
+    const SIZE_IN_BYTES: usize = 8;
+}
+
 impl BinarySerializable for u8 {
     fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u8(*self)
@@ -173,6 +186,11 @@ pub mod test {
     }
 
     #[test]
+    fn test_serialize_f64() {
+        fixed_size_test::<f64>();
+    }
+
+    #[test]
     fn test_serialize_u64() {
         fixed_size_test::<u64>();
     }
@@ -181,10 +199,7 @@ pub mod test {
     fn test_serialize_string() {
         assert_eq!(serialize_test(String::from("")), 1);
         assert_eq!(serialize_test(String::from("ぽよぽよ")), 1 + 3 * 4);
-        assert_eq!(
-            serialize_test(String::from("富士さん見える。")),
-            1 + 3 * 8
-        );
+        assert_eq!(serialize_test(String::from("富士さん見える。")), 1 + 3 * 8);
     }
 
     #[test]

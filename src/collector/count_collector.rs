@@ -1,7 +1,6 @@
 use super::Collector;
 use crate::collector::SegmentCollector;
 use crate::DocId;
-use crate::Result;
 use crate::Score;
 use crate::SegmentLocalId;
 use crate::SegmentReader;
@@ -10,49 +9,32 @@ use crate::SegmentReader;
 /// documents match the query.
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate tantivy;
-/// use tantivy::schema::{Schema, TEXT};
-/// use tantivy::{Index, Result};
 /// use tantivy::collector::Count;
 /// use tantivy::query::QueryParser;
+/// use tantivy::schema::{Schema, TEXT};
+/// use tantivy::{doc, Index};
 ///
-/// # fn main() { example().unwrap(); }
-/// fn example() -> Result<()> {
-///     let mut schema_builder = Schema::builder();
-///     let title = schema_builder.add_text_field("title", TEXT);
-///     let schema = schema_builder.build();
-///     let index = Index::create_in_ram(schema);
-///     {
-///         let mut index_writer = index.writer(3_000_000)?;
-///         index_writer.add_document(doc!(
-///             title => "The Name of the Wind",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of Muadib",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "A Dairy Cow",
-///         ));
-///         index_writer.add_document(doc!(
-///             title => "The Diary of a Young Girl",
-///         ));
-///         index_writer.commit().unwrap();
-///     }
+/// let mut schema_builder = Schema::builder();
+/// let title = schema_builder.add_text_field("title", TEXT);
+/// let schema = schema_builder.build();
+/// let index = Index::create_in_ram(schema);
 ///
-///     let reader = index.reader()?;
-///     let searcher = reader.searcher();
+/// let mut index_writer = index.writer(3_000_000).unwrap();
+/// index_writer.add_document(doc!(title => "The Name of the Wind"));
+/// index_writer.add_document(doc!(title => "The Diary of Muadib"));
+/// index_writer.add_document(doc!(title => "A Dairy Cow"));
+/// index_writer.add_document(doc!(title => "The Diary of a Young Girl"));
+/// assert!(index_writer.commit().is_ok());
 ///
-///     {
-///         let query_parser = QueryParser::for_index(&index, vec![title]);
-///         let query = query_parser.parse_query("diary")?;
-///         let count = searcher.search(&query, &Count).unwrap();
+/// let reader = index.reader().unwrap();
+/// let searcher = reader.searcher();
 ///
-///         assert_eq!(count, 2);
-///     }
+/// // Here comes the important part
+/// let query_parser = QueryParser::for_index(&index, vec![title]);
+/// let query = query_parser.parse_query("diary").unwrap();
+/// let count = searcher.search(&query, &Count).unwrap();
 ///
-///     Ok(())
-/// }
+/// assert_eq!(count, 2);
 /// ```
 pub struct Count;
 
@@ -61,7 +43,11 @@ impl Collector for Count {
 
     type Child = SegmentCountCollector;
 
-    fn for_segment(&self, _: SegmentLocalId, _: &SegmentReader) -> Result<SegmentCountCollector> {
+    fn for_segment(
+        &self,
+        _: SegmentLocalId,
+        _: &SegmentReader,
+    ) -> crate::Result<SegmentCountCollector> {
         Ok(SegmentCountCollector::default())
     }
 
@@ -69,7 +55,7 @@ impl Collector for Count {
         false
     }
 
-    fn merge_fruits(&self, segment_counts: Vec<usize>) -> Result<usize> {
+    fn merge_fruits(&self, segment_counts: Vec<usize>) -> crate::Result<usize> {
         Ok(segment_counts.into_iter().sum())
     }
 }
@@ -125,5 +111,4 @@ mod tests {
             assert_eq!(count_collector.harvest(), 2);
         }
     }
-
 }

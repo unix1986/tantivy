@@ -11,7 +11,7 @@ use crate::termdict::TermOrdinal;
 use crate::tokenizer::TokenStream;
 use crate::tokenizer::{Token, MAX_TOKEN_LEN};
 use crate::DocId;
-use crate::Result;
+use fnv::FnvHashMap;
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
@@ -35,6 +35,7 @@ fn posting_from_field_entry(field_entry: &FieldEntry) -> Box<dyn PostingsWriter>
             .unwrap_or_else(|| SpecializedPostingsWriter::<NothingRecorder>::new_boxed()),
         FieldType::U64(_)
         | FieldType::I64(_)
+        | FieldType::F64(_)
         | FieldType::Date(_)
         | FieldType::HierarchicalFacet => SpecializedPostingsWriter::<NothingRecorder>::new_boxed(),
         FieldType::Bytes => {
@@ -59,12 +60,12 @@ fn make_field_partition(
         .iter()
         .map(|(key, _, _)| Term::wrap(key).field())
         .enumerate();
-    let mut prev_field = Field(u32::max_value());
+    let mut prev_field_opt = None;
     let mut fields = vec![];
     let mut offsets = vec![];
     for (offset, field) in term_offsets_it {
-        if field != prev_field {
-            prev_field = field;
+        if Some(field) != prev_field_opt {
+            prev_field_opt = Some(field);
             fields.push(field);
             offsets.push(offset);
         }
@@ -84,8 +85,7 @@ impl MultiFieldPostingsWriter {
         let term_index = TermHashMap::new(table_bits);
         let per_field_postings_writers: Vec<_> = schema
             .fields()
-            .iter()
-            .map(|field_entry| posting_from_field_entry(field_entry))
+            .map(|(_, field_entry)| posting_from_field_entry(field_entry))
             .collect();
         MultiFieldPostingsWriter {
             heap: MemoryArena::new(),
@@ -105,7 +105,8 @@ impl MultiFieldPostingsWriter {
         field: Field,
         token_stream: &mut dyn TokenStream,
     ) -> u32 {
-        let postings_writer = self.per_field_postings_writers[field.0 as usize].deref_mut();
+        let postings_writer =
+            self.per_field_postings_writers[field.field_id() as usize].deref_mut();
         postings_writer.index_text(
             &mut self.term_index,
             doc,
@@ -116,7 +117,8 @@ impl MultiFieldPostingsWriter {
     }
 
     pub fn subscribe(&mut self, doc: DocId, term: &Term) -> UnorderedTermId {
-        let postings_writer = self.per_field_postings_writers[term.field().0 as usize].deref_mut();
+        let postings_writer =
+            self.per_field_postings_writers[term.field().field_id() as usize].deref_mut();
         postings_writer.subscribe(&mut self.term_index, doc, 0u32, term, &mut self.heap)
     }
 
@@ -126,12 +128,12 @@ impl MultiFieldPostingsWriter {
     pub fn serialize(
         &self,
         serializer: &mut InvertedIndexSerializer,
-    ) -> Result<HashMap<Field, HashMap<UnorderedTermId, TermOrdinal>>> {
+    ) -> crate::Result<HashMap<Field, FnvHashMap<UnorderedTermId, TermOrdinal>>> {
         let mut term_offsets: Vec<(&[u8], Addr, UnorderedTermId)> =
             self.term_index.iter().collect();
         term_offsets.sort_unstable_by_key(|&(k, _, _)| k);
 
-        let mut unordered_term_mappings: HashMap<Field, HashMap<UnorderedTermId, TermOrdinal>> =
+        let mut unordered_term_mappings: HashMap<Field, FnvHashMap<UnorderedTermId, TermOrdinal>> =
             HashMap::new();
 
         let field_offsets = make_field_partition(&term_offsets);
@@ -146,7 +148,7 @@ impl MultiFieldPostingsWriter {
                     let unordered_term_ids = term_offsets[start..stop]
                         .iter()
                         .map(|&(_, _, bucket)| bucket);
-                    let mapping: HashMap<UnorderedTermId, TermOrdinal> = unordered_term_ids
+                    let mapping: FnvHashMap<UnorderedTermId, TermOrdinal> = unordered_term_ids
                         .enumerate()
                         .map(|(term_ord, unord_term_id)| {
                             (unord_term_id as UnorderedTermId, term_ord as TermOrdinal)
@@ -154,11 +156,11 @@ impl MultiFieldPostingsWriter {
                         .collect();
                     unordered_term_mappings.insert(field, mapping);
                 }
-                FieldType::U64(_) | FieldType::I64(_) | FieldType::Date(_) => {}
+                FieldType::U64(_) | FieldType::I64(_) | FieldType::F64(_) | FieldType::Date(_) => {}
                 FieldType::Bytes => {}
             }
 
-            let postings_writer = &self.per_field_postings_writers[field.0 as usize];
+            let postings_writer = &self.per_field_postings_writers[field.field_id() as usize];
             let mut field_serializer =
                 serializer.new_field(field, postings_writer.total_num_tokens())?;
             postings_writer.serialize(

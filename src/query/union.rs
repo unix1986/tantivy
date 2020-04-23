@@ -28,7 +28,7 @@ where
     }
 }
 
-/// Creates a `DocSet` that iterator through the intersection of two `DocSet`s.
+/// Creates a `DocSet` that iterate through the union of two or more `DocSet`s.
 pub struct Union<TScorer, TScoreCombiner = DoNothingCombiner> {
     docsets: Vec<TScorer>,
     bitsets: Box<[TinySet; HORIZON_NUM_TINYBITSETS]>,
@@ -145,26 +145,6 @@ where
         }
     }
 
-    fn count_including_deleted(&mut self) -> u32 {
-        let mut count = self.bitsets[self.cursor..HORIZON_NUM_TINYBITSETS]
-            .iter()
-            .map(|bitset| bitset.len())
-            .sum::<u32>();
-        for bitset in self.bitsets.iter_mut() {
-            bitset.clear();
-        }
-        while self.refill() {
-            count += self.bitsets.iter().map(|bitset| bitset.len()).sum::<u32>();
-            for bitset in self.bitsets.iter_mut() {
-                bitset.clear();
-            }
-        }
-        self.cursor = HORIZON_NUM_TINYBITSETS;
-        count
-    }
-
-    // TODO implement `count` efficiently.
-
     fn skip_next(&mut self, target: DocId) -> SkipResult {
         if !self.advance() {
             return SkipResult::End;
@@ -243,12 +223,32 @@ where
         }
     }
 
+    // TODO implement `count` efficiently.
+
     fn doc(&self) -> DocId {
         self.doc
     }
 
     fn size_hint(&self) -> u32 {
         0u32
+    }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        let mut count = self.bitsets[self.cursor..HORIZON_NUM_TINYBITSETS]
+            .iter()
+            .map(|bitset| bitset.len())
+            .sum::<u32>();
+        for bitset in self.bitsets.iter_mut() {
+            bitset.clear();
+        }
+        while self.refill() {
+            count += self.bitsets.iter().map(|bitset| bitset.len()).sum::<u32>();
+            for bitset in self.bitsets.iter_mut() {
+                bitset.clear();
+            }
+        }
+        self.cursor = HORIZON_NUM_TINYBITSETS;
+        count
     }
 }
 
@@ -290,7 +290,7 @@ mod tests {
                 vals.iter()
                     .cloned()
                     .map(VecDocSet::from)
-                    .map(ConstScorer::new)
+                    .map(|docset| ConstScorer::new(docset, 1.0f32))
                     .collect::<Vec<ConstScorer<VecDocSet>>>(),
             )
         };
@@ -339,7 +339,7 @@ mod tests {
                     .iter()
                     .map(|docs| docs.clone())
                     .map(VecDocSet::from)
-                    .map(ConstScorer::new)
+                    .map(|docset| ConstScorer::new(docset, 1.0f32))
                     .collect::<Vec<_>>(),
             ));
             res
@@ -369,8 +369,8 @@ mod tests {
     #[test]
     fn test_union_skip_corner_case3() {
         let mut docset = Union::<_, DoNothingCombiner>::from(vec![
-            ConstScorer::new(VecDocSet::from(vec![0u32, 5u32])),
-            ConstScorer::new(VecDocSet::from(vec![1u32, 4u32])),
+            ConstScorer::from(VecDocSet::from(vec![0u32, 5u32])),
+            ConstScorer::from(VecDocSet::from(vec![1u32, 4u32])),
         ]);
         assert!(docset.advance());
         assert_eq!(docset.doc(), 0u32);
@@ -409,20 +409,17 @@ mod tests {
             vec![1, 2, 3, 7, 8, 9, 99, 100, 101, 500, 20000],
         );
     }
-
 }
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench {
 
-    use query::score_combiner::DoNothingCombiner;
-    use query::ConstScorer;
-    use query::Union;
-    use query::VecDocSet;
+    use crate::query::score_combiner::DoNothingCombiner;
+    use crate::query::{ConstScorer, Union, VecDocSet};
+    use crate::tests;
+    use crate::DocId;
+    use crate::DocSet;
     use test::Bencher;
-    use tests;
-    use DocId;
-    use DocSet;
 
     #[bench]
     fn bench_union_3_high(bench: &mut Bencher) {

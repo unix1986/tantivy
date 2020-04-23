@@ -5,7 +5,6 @@ use crate::fastfield::FacetReader;
 use crate::schema::Facet;
 use crate::schema::Field;
 use crate::DocId;
-use crate::Result;
 use crate::Score;
 use crate::SegmentLocalId;
 use crate::SegmentReader;
@@ -81,15 +80,12 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///
 ///
 /// ```rust
-/// #[macro_use]
-/// extern crate tantivy;
-/// use tantivy::schema::{Facet, Schema, TEXT};
-/// use tantivy::{Index, Result};
 /// use tantivy::collector::FacetCollector;
 /// use tantivy::query::AllQuery;
+/// use tantivy::schema::{Facet, Schema, TEXT};
+/// use tantivy::{doc, Index};
 ///
-/// # fn main() { example().unwrap(); }
-/// fn example() -> Result<()> {
+/// fn example() -> tantivy::Result<()> {
 ///     let mut schema_builder = Schema::builder();
 ///
 ///     // Facet have their own specific type.
@@ -129,7 +125,7 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///     let searcher = reader.searcher();
 ///
 ///     {
-///			let mut facet_collector = FacetCollector::for_field(facet);
+///         let mut facet_collector = FacetCollector::for_field(facet);
 ///         facet_collector.add_facet("/lang");
 ///         facet_collector.add_facet("/category");
 ///         let facet_counts = searcher.search(&AllQuery, &facet_collector)?;
@@ -145,7 +141,7 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///     }
 ///
 ///     {
-///			let mut facet_collector = FacetCollector::for_field(facet);
+///         let mut facet_collector = FacetCollector::for_field(facet);
 ///         facet_collector.add_facet("/category/fiction");
 ///         let facet_counts = searcher.search(&AllQuery, &facet_collector)?;
 ///
@@ -160,8 +156,8 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///         ]);
 ///     }
 ///
-///    {
-///			let mut facet_collector = FacetCollector::for_field(facet);
+///     {
+///         let mut facet_collector = FacetCollector::for_field(facet);
 ///         facet_collector.add_facet("/category/fiction");
 ///         let facet_counts = searcher.search(&AllQuery, &facet_collector)?;
 ///
@@ -174,6 +170,7 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///
 ///     Ok(())
 /// }
+/// # assert!(example().is_ok());
 /// ```
 pub struct FacetCollector {
     field: Field,
@@ -264,7 +261,7 @@ impl Collector for FacetCollector {
         &self,
         _: SegmentLocalId,
         reader: &SegmentReader,
-    ) -> Result<FacetSegmentCollector> {
+    ) -> crate::Result<FacetSegmentCollector> {
         let field_name = reader.schema().get_field_name(self.field);
         let facet_reader = reader.facet_reader(self.field).ok_or_else(|| {
             TantivyError::SchemaError(format!("Field {:?} is not a facet field.", field_name))
@@ -330,7 +327,7 @@ impl Collector for FacetCollector {
         false
     }
 
-    fn merge_fruits(&self, segments_facet_counts: Vec<FacetCounts>) -> Result<FacetCounts> {
+    fn merge_fruits(&self, segments_facet_counts: Vec<FacetCounts>) -> crate::Result<FacetCounts> {
         let mut facet_counts: BTreeMap<Facet, u64> = BTreeMap::new();
         for segment_facet_counts in segments_facet_counts {
             for (facet, count) in segment_facet_counts.facet_counts {
@@ -454,9 +451,11 @@ impl FacetCounts {
 #[cfg(test)]
 mod tests {
     use super::{FacetCollector, FacetCounts};
+    use crate::collector::Count;
     use crate::core::Index;
-    use crate::query::AllQuery;
-    use crate::schema::{Document, Facet, Field, Schema};
+    use crate::query::{AllQuery, QueryParser, TermQuery};
+    use crate::schema::{Document, Facet, Field, IndexRecordOption, Schema};
+    use crate::Term;
     use rand::distributions::Uniform;
     use rand::prelude::SliceRandom;
     use rand::{thread_rng, Rng};
@@ -517,7 +516,7 @@ mod tests {
     #[should_panic(expected = "Tried to add a facet which is a descendant of \
                                an already added facet.")]
     fn test_misused_facet_collector() {
-        let mut facet_collector = FacetCollector::for_field(Field(0));
+        let mut facet_collector = FacetCollector::for_field(Field::from_field_id(0));
         facet_collector.add_facet(Facet::from("/country"));
         facet_collector.add_facet(Facet::from("/country/europe"));
     }
@@ -547,8 +546,58 @@ mod tests {
     }
 
     #[test]
+    fn test_doc_search_by_facet() {
+        let mut schema_builder = Schema::builder();
+        let facet_field = schema_builder.add_facet_field("facet");
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
+        index_writer.add_document(doc!(
+            facet_field => Facet::from_text(&"/A/A"),
+        ));
+        index_writer.add_document(doc!(
+            facet_field => Facet::from_text(&"/A/B"),
+        ));
+        index_writer.add_document(doc!(
+            facet_field => Facet::from_text(&"/A/C/A"),
+        ));
+        index_writer.add_document(doc!(
+            facet_field => Facet::from_text(&"/D/C/A"),
+        ));
+        index_writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 4);
+
+        let count_facet = |facet_str: &str| {
+            let term = Term::from_facet(facet_field, &Facet::from_text(facet_str));
+            searcher
+                .search(&TermQuery::new(term, IndexRecordOption::Basic), &Count)
+                .unwrap()
+        };
+
+        assert_eq!(count_facet("/"), 4);
+        assert_eq!(count_facet("/A"), 3);
+        assert_eq!(count_facet("/A/B"), 1);
+        assert_eq!(count_facet("/A/C"), 1);
+        assert_eq!(count_facet("/A/C/A"), 1);
+        assert_eq!(count_facet("/C/A"), 0);
+        {
+            let query_parser = QueryParser::for_index(&index, vec![]);
+            {
+                let query = query_parser.parse_query("facet:/A/B").unwrap();
+                assert_eq!(1, searcher.search(&query, &Count).unwrap());
+            }
+            {
+                let query = query_parser.parse_query("facet:/A").unwrap();
+                assert_eq!(3, searcher.search(&query, &Count).unwrap());
+            }
+        }
+    }
+
+    #[test]
     fn test_non_used_facet_collector() {
-        let mut facet_collector = FacetCollector::for_field(Field(0));
+        let mut facet_collector = FacetCollector::for_field(Field::from_field_id(0));
         facet_collector.add_facet(Facet::from("/country"));
         facet_collector.add_facet(Facet::from("/countryeurope"));
     }
@@ -601,19 +650,18 @@ mod tests {
             );
         }
     }
-
 }
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench {
 
-    use collector::FacetCollector;
-    use query::AllQuery;
-    use rand::{thread_rng, Rng};
-    use schema::Facet;
-    use schema::Schema;
+    use crate::collector::FacetCollector;
+    use crate::query::AllQuery;
+    use crate::schema::{Facet, Schema};
+    use crate::Index;
+    use rand::seq::SliceRandom;
+    use rand::thread_rng;
     use test::Bencher;
-    use Index;
 
     #[bench]
     fn bench_facet_collector(b: &mut Bencher) {
@@ -630,7 +678,7 @@ mod bench {
             }
         }
         // 40425 docs
-        thread_rng().shuffle(&mut docs[..]);
+        docs[..].shuffle(&mut thread_rng());
 
         let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
         for doc in docs {
@@ -639,7 +687,7 @@ mod bench {
         index_writer.commit().unwrap();
         let reader = index.reader().unwrap();
         b.iter(|| {
-            let searcher = index.searcher();
+            let searcher = reader.searcher();
             let facet_collector = FacetCollector::for_field(facet_field);
             searcher.search(&AllQuery, &facet_collector).unwrap();
         });

@@ -7,18 +7,17 @@ pub use self::phrase_scorer::PhraseScorer;
 pub use self::phrase_weight::PhraseWeight;
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
     use super::*;
-    use crate::collector::tests::TestCollector;
+    use crate::collector::tests::{TEST_COLLECTOR_WITHOUT_SCORE, TEST_COLLECTOR_WITH_SCORE};
     use crate::core::Index;
-    use crate::error::TantivyError;
     use crate::schema::{Schema, Term, TEXT};
     use crate::tests::assert_nearly_equals;
     use crate::DocAddress;
     use crate::DocId;
 
-    fn create_index(texts: &[&'static str]) -> Index {
+    pub fn create_index(texts: &[&'static str]) -> Index {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
@@ -53,7 +52,41 @@ mod tests {
                 .collect();
             let phrase_query = PhraseQuery::new(terms);
             let test_fruits = searcher
-                .search(&phrase_query, &TestCollector)
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+                .expect("search should succeed");
+            test_fruits
+                .docs()
+                .iter()
+                .map(|docaddr| docaddr.1)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(test_query(vec!["a", "b", "c"]), vec![2, 4]);
+        assert_eq!(test_query(vec!["a", "b"]), vec![1, 2, 3, 4]);
+        assert_eq!(test_query(vec!["b", "b"]), vec![0, 1]);
+        assert!(test_query(vec!["g", "ewrwer"]).is_empty());
+        assert!(test_query(vec!["g", "a"]).is_empty());
+    }
+
+    #[test]
+    pub fn test_phrase_query_no_score() {
+        let index = create_index(&[
+            "b b b d c g c",
+            "a b b d c g c",
+            "a b a b c",
+            "c a b a d ga a",
+            "a b c",
+        ]);
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let test_query = |texts: Vec<&str>| {
+            let terms: Vec<Term> = texts
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let phrase_query = PhraseQuery::new(terms);
+            let test_fruits = searcher
+                .search(&phrase_query, &TEST_COLLECTOR_WITHOUT_SCORE)
                 .expect("search should succeed");
             test_fruits
                 .docs()
@@ -93,18 +126,16 @@ mod tests {
             Term::from_field_text(text_field, "a"),
             Term::from_field_text(text_field, "b"),
         ]);
-        if let TantivyError::SchemaError(ref msg) = searcher
-            .search(&phrase_query, &TestCollector)
-            .map(|_| ())
-            .unwrap_err()
-        {
-            assert_eq!(
-                "Applied phrase query on field \"text\", which does not have positions indexed",
-                msg.as_str()
-            );
-        } else {
-            panic!("Should have returned an error");
-        }
+
+        let search_result = searcher
+            .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+            .map(|_| ());
+        assert!(matches!(
+            search_result,
+            Err(crate::TantivyError::SchemaError(msg))
+            if msg == "Applied phrase query on field \"text\", which does not have positions \
+            indexed"
+        ));
     }
 
     #[test]
@@ -120,7 +151,7 @@ mod tests {
                 .collect();
             let phrase_query = PhraseQuery::new(terms);
             searcher
-                .search(&phrase_query, &TestCollector)
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
                 .expect("search should succeed")
                 .scores()
                 .to_vec()
@@ -152,7 +183,7 @@ mod tests {
                 .collect();
             let phrase_query = PhraseQuery::new(terms);
             searcher
-                .search(&phrase_query, &TestCollector)
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
                 .expect("search should succeed")
                 .docs()
                 .to_vec()
@@ -180,7 +211,7 @@ mod tests {
                 .collect();
             let phrase_query = PhraseQuery::new_with_offset(terms);
             searcher
-                .search(&phrase_query, &TestCollector)
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
                 .expect("search should succeed")
                 .docs()
                 .iter()

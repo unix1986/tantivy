@@ -11,6 +11,7 @@ use crate::directory::error::{
     DeleteError, IOError, OpenDirectoryError, OpenReadError, OpenWriteError,
 };
 use crate::directory::read_only_source::BoxedData;
+use crate::directory::AntiCallToken;
 use crate::directory::Directory;
 use crate::directory::DirectoryLock;
 use crate::directory::Lock;
@@ -18,9 +19,10 @@ use crate::directory::ReadOnlySource;
 use crate::directory::WatchCallback;
 use crate::directory::WatchCallbackList;
 use crate::directory::WatchHandle;
-use crate::directory::WritePtr;
+use crate::directory::{TerminatingWrite, WritePtr};
 use atomicwrites;
 use memmap::Mmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
@@ -36,7 +38,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::Weak;
 use std::thread;
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 /// Create a default io error given a string.
 pub(crate) fn make_io_err(msg: String) -> io::Error {
@@ -130,53 +132,38 @@ impl MmapCache {
         }
         self.cache.remove(full_path);
         self.counters.miss += 1;
-        Ok(if let Some(mmap) = open_mmap(full_path)? {
+        let mmap_opt = open_mmap(full_path)?;
+        Ok(mmap_opt.map(|mmap| {
             let mmap_arc: Arc<BoxedData> = Arc::new(Box::new(mmap));
             let mmap_weak = Arc::downgrade(&mmap_arc);
             self.cache.insert(full_path.to_owned(), mmap_weak);
-            Some(mmap_arc)
-        } else {
-            None
-        })
+            mmap_arc
+        }))
     }
 }
 
-struct InnerWatcherWrapper {
+struct WatcherWrapper {
     _watcher: Mutex<notify::RecommendedWatcher>,
-    watcher_router: WatchCallbackList,
-}
-
-impl InnerWatcherWrapper {
-    pub fn new(path: &Path) -> Result<(Self, Receiver<notify::RawEvent>), notify::Error> {
-        let (tx, watcher_recv): (Sender<RawEvent>, Receiver<RawEvent>) = channel();
-        // We need to initialize the
-        let mut watcher = notify::raw_watcher(tx)?;
-        watcher.watch(path, RecursiveMode::Recursive)?;
-        let inner = InnerWatcherWrapper {
-            _watcher: Mutex::new(watcher),
-            watcher_router: Default::default(),
-        };
-        Ok((inner, watcher_recv))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct WatcherWrapper {
-    inner: Arc<InnerWatcherWrapper>,
+    watcher_router: Arc<WatchCallbackList>,
 }
 
 impl WatcherWrapper {
     pub fn new(path: &Path) -> Result<Self, OpenDirectoryError> {
-        let (inner, watcher_recv) = InnerWatcherWrapper::new(path).map_err(|err| match err {
-            notify::Error::PathNotFound => OpenDirectoryError::DoesNotExist(path.to_owned()),
-            _ => {
-                panic!("Unknown error while starting watching directory {:?}", path);
-            }
-        })?;
-        let watcher_wrapper = WatcherWrapper {
-            inner: Arc::new(inner),
-        };
-        let watcher_wrapper_clone = watcher_wrapper.clone();
+        let (tx, watcher_recv): (Sender<RawEvent>, Receiver<RawEvent>) = channel();
+        // We need to initialize the
+        let watcher = notify::raw_watcher(tx)
+            .and_then(|mut watcher| {
+                watcher.watch(path, RecursiveMode::Recursive)?;
+                Ok(watcher)
+            })
+            .map_err(|err| match err {
+                notify::Error::PathNotFound => OpenDirectoryError::DoesNotExist(path.to_owned()),
+                _ => {
+                    panic!("Unknown error while starting watching directory {:?}", path);
+                }
+            })?;
+        let watcher_router: Arc<WatchCallbackList> = Default::default();
+        let watcher_router_clone = watcher_router.clone();
         thread::Builder::new()
             .name("meta-file-watch-thread".to_string())
             .spawn(move || {
@@ -187,7 +174,7 @@ impl WatcherWrapper {
                             // We might want to be more accurate than this at one point.
                             if let Some(filename) = changed_path.file_name() {
                                 if filename == *META_FILEPATH {
-                                    watcher_wrapper_clone.inner.watcher_router.broadcast();
+                                    let _ = watcher_router_clone.broadcast();
                                 }
                             }
                         }
@@ -200,13 +187,15 @@ impl WatcherWrapper {
                         }
                     }
                 }
-            })
-            .expect("Failed to spawn thread to watch meta.json");
-        Ok(watcher_wrapper)
+            })?;
+        Ok(WatcherWrapper {
+            _watcher: Mutex::new(watcher),
+            watcher_router,
+        })
     }
 
     pub fn watch(&mut self, watch_callback: WatchCallback) -> WatchHandle {
-        self.inner.watcher_router.subscribe(watch_callback)
+        self.watcher_router.subscribe(watch_callback)
     }
 }
 
@@ -231,7 +220,7 @@ struct MmapDirectoryInner {
     root_path: PathBuf,
     mmap_cache: RwLock<MmapCache>,
     _temp_directory: Option<TempDir>,
-    watcher: RwLock<WatcherWrapper>,
+    watcher: RwLock<Option<WatcherWrapper>>,
 }
 
 impl MmapDirectoryInner {
@@ -239,19 +228,36 @@ impl MmapDirectoryInner {
         root_path: PathBuf,
         temp_directory: Option<TempDir>,
     ) -> Result<MmapDirectoryInner, OpenDirectoryError> {
-        let watch_wrapper = WatcherWrapper::new(&root_path)?;
         let mmap_directory_inner = MmapDirectoryInner {
             root_path,
             mmap_cache: Default::default(),
             _temp_directory: temp_directory,
-            watcher: RwLock::new(watch_wrapper),
+            watcher: RwLock::new(None),
         };
         Ok(mmap_directory_inner)
     }
 
-    fn watch(&self, watch_callback: WatchCallback) -> WatchHandle {
-        let mut wlock = self.watcher.write().unwrap();
-        wlock.watch(watch_callback)
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+        // a lot of juggling here, to ensure we don't do anything that panics
+        // while the rwlock is held. That way we ensure that the rwlock cannot
+        // be poisoned.
+        //
+        // The downside is that we might create a watch wrapper that is not useful.
+        let need_initialization = self.watcher.read().unwrap().is_none();
+        if need_initialization {
+            let watch_wrapper = WatcherWrapper::new(&self.root_path)?;
+            let mut watch_wlock = self.watcher.write().unwrap();
+            // the watcher could have been initialized when we released the lock, and
+            // we do not want to lose the watched files that were set.
+            if watch_wlock.is_none() {
+                *watch_wlock = Some(watch_wrapper);
+            }
+        }
+        if let Some(watch_wrapper) = self.watcher.write().unwrap().as_mut() {
+            Ok(watch_wrapper.watch(watch_callback))
+        } else {
+            unreachable!("At this point, watch wrapper is supposed to be initialized");
+        }
     }
 }
 
@@ -277,7 +283,7 @@ impl MmapDirectory {
     /// This is mostly useful to test the MmapDirectory itself.
     /// For your unit tests, prefer the RAMDirectory.
     pub fn create_from_tempdir() -> Result<MmapDirectory, OpenDirectoryError> {
-        let tempdir = TempDir::new("index").map_err(OpenDirectoryError::IoError)?;
+        let tempdir = TempDir::new().map_err(OpenDirectoryError::IoError)?;
         let tempdir_path = PathBuf::from(tempdir.path());
         MmapDirectory::new(tempdir_path, Some(tempdir))
     }
@@ -395,6 +401,12 @@ impl Seek for SafeFileWriter {
     }
 }
 
+impl TerminatingWrite for SafeFileWriter {
+    fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
+        self.flush()
+    }
+}
+
 impl Directory for MmapDirectory {
     fn open_read(&self, path: &Path) -> result::Result<ReadOnlySource, OpenReadError> {
         debug!("Open Read {:?}", path);
@@ -417,7 +429,6 @@ impl Directory for MmapDirectory {
     /// Any entry associated to the path in the mmap will be
     /// removed before the file is deleted.
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
-        debug!("Deleting file {:?}", path);
         let full_path = self.resolve_path(path);
         match fs::remove_file(&full_path) {
             Ok(_) => self
@@ -515,7 +526,7 @@ impl Directory for MmapDirectory {
         })))
     }
 
-    fn watch(&self, watch_callback: WatchCallback) -> WatchHandle {
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
         self.inner.watch(watch_callback)
     }
 }
@@ -527,16 +538,15 @@ mod tests {
     // The following tests are specific to the MmapDirectory
 
     use super::*;
+    use crate::indexer::LogMergePolicy;
     use crate::schema::{Schema, SchemaBuilder, TEXT};
     use crate::Index;
     use crate::ReloadPolicy;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
-    fn test_open_non_existant_path() {
+    fn test_open_non_existent_path() {
         assert!(MmapDirectory::open(PathBuf::from("./nowhere")).is_err());
     }
 
@@ -626,16 +636,21 @@ mod tests {
     fn test_watch_wrapper() {
         let counter: Arc<AtomicUsize> = Default::default();
         let counter_clone = counter.clone();
-        let tmp_dir: TempDir = tempdir::TempDir::new("test_watch_wrapper").unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
         let tmp_dirpath = tmp_dir.path().to_owned();
         let mut watch_wrapper = WatcherWrapper::new(&tmp_dirpath).unwrap();
-        let tmp_file = tmp_dirpath.join("coucou");
+        let tmp_file = tmp_dirpath.join(*META_FILEPATH);
         let _handle = watch_wrapper.watch(Box::new(move || {
             counter_clone.fetch_add(1, Ordering::SeqCst);
         }));
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let _handle2 = watch_wrapper.watch(Box::new(move || {
+            let _ = sender.send(());
+        }));
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         fs::write(&tmp_file, b"whateverwilldo").unwrap();
-        thread::sleep(Duration::new(0, 1_000u32));
+        assert!(receiver.recv().is_ok());
+        assert!(counter.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
@@ -644,34 +659,42 @@ mod tests {
         let mut schema_builder: SchemaBuilder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
+
         {
             let index = Index::create(mmap_directory.clone(), schema).unwrap();
+
             let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
-            for _num_commits in 0..16 {
+            let mut log_merge_policy = LogMergePolicy::default();
+            log_merge_policy.set_min_merge_size(3);
+            index_writer.set_merge_policy(Box::new(log_merge_policy));
+            for _num_commits in 0..10 {
                 for _ in 0..10 {
                     index_writer.add_document(doc!(text_field=>"abc"));
                 }
                 index_writer.commit().unwrap();
             }
+
             let reader = index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::Manual)
                 .try_into()
                 .unwrap();
-            for _ in 0..30 {
+
+            for _ in 0..4 {
                 index_writer.add_document(doc!(text_field=>"abc"));
                 index_writer.commit().unwrap();
                 reader.reload().unwrap();
             }
             index_writer.wait_merging_threads().unwrap();
+
             reader.reload().unwrap();
             let num_segments = reader.searcher().segment_readers().len();
-            assert_eq!(num_segments, 4);
+            assert!(num_segments <= 4);
             assert_eq!(
                 num_segments * 7,
                 mmap_directory.get_cache_info().mmapped.len()
             );
         }
-        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 0);
+        assert!(mmap_directory.get_cache_info().mmapped.is_empty());
     }
 }

@@ -1,10 +1,10 @@
 use crate::core::Searcher;
 use crate::core::SegmentReader;
 use crate::docset::DocSet;
+use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::{Explanation, Query, Scorer, Weight};
 use crate::DocId;
-use crate::Result;
 use crate::Score;
 
 /// Query that matches all of the documents.
@@ -14,7 +14,7 @@ use crate::Score;
 pub struct AllQuery;
 
 impl Query for AllQuery {
-    fn weight(&self, _: &Searcher, _: bool) -> Result<Box<dyn Weight>> {
+    fn weight(&self, _: &Searcher, _: bool) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(AllWeight))
     }
 }
@@ -23,15 +23,16 @@ impl Query for AllQuery {
 pub struct AllWeight;
 
 impl Weight for AllWeight {
-    fn scorer(&self, reader: &SegmentReader) -> Result<Box<dyn Scorer>> {
-        Ok(Box::new(AllScorer {
+    fn scorer(&self, reader: &SegmentReader, boost: f32) -> crate::Result<Box<dyn Scorer>> {
+        let all_scorer = AllScorer {
             state: State::NotStarted,
             doc: 0u32,
             max_doc: reader.max_doc(),
-        }))
+        };
+        Ok(Box::new(BoostScorer::new(all_scorer, boost)))
     }
 
-    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         if doc >= reader.max_doc() {
             return Err(does_not_match(doc));
         }
@@ -91,14 +92,12 @@ impl Scorer for AllScorer {
 
 #[cfg(test)]
 mod tests {
-
     use super::AllQuery;
     use crate::query::Query;
     use crate::schema::{Schema, TEXT};
     use crate::Index;
 
-    #[test]
-    fn test_all_query() {
+    fn create_test_index() -> Index {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
@@ -109,13 +108,18 @@ mod tests {
         index_writer.commit().unwrap();
         index_writer.add_document(doc!(field=>"ccc"));
         index_writer.commit().unwrap();
+        index
+    }
+
+    #[test]
+    fn test_all_query() {
+        let index = create_test_index();
         let reader = index.reader().unwrap();
-        reader.reload().unwrap();
         let searcher = reader.searcher();
         let weight = AllQuery.weight(&searcher, false).unwrap();
         {
             let reader = searcher.segment_reader(0);
-            let mut scorer = weight.scorer(reader).unwrap();
+            let mut scorer = weight.scorer(reader, 1.0f32).unwrap();
             assert!(scorer.advance());
             assert_eq!(scorer.doc(), 0u32);
             assert!(scorer.advance());
@@ -124,11 +128,31 @@ mod tests {
         }
         {
             let reader = searcher.segment_reader(1);
-            let mut scorer = weight.scorer(reader).unwrap();
+            let mut scorer = weight.scorer(reader, 1.0f32).unwrap();
             assert!(scorer.advance());
             assert_eq!(scorer.doc(), 0u32);
             assert!(!scorer.advance());
         }
     }
 
+    #[test]
+    fn test_all_query_with_boost() {
+        let index = create_test_index();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let weight = AllQuery.weight(&searcher, false).unwrap();
+        let reader = searcher.segment_reader(0);
+        {
+            let mut scorer = weight.scorer(reader, 2.0f32).unwrap();
+            assert!(scorer.advance());
+            assert_eq!(scorer.doc(), 0u32);
+            assert_eq!(scorer.score(), 2.0f32);
+        }
+        {
+            let mut scorer = weight.scorer(reader, 1.5f32).unwrap();
+            assert!(scorer.advance());
+            assert_eq!(scorer.doc(), 0u32);
+            assert_eq!(scorer.score(), 1.5f32);
+        }
+    }
 }

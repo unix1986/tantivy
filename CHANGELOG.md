@@ -1,3 +1,75 @@
+Tantivy 0.13.0
+======================
+- Bugfix in `FuzzyTermQuery` not matching terms by prefix when it should (@Peachball)
+- Relaxed constraints on the custom/tweak score functions. At the segment level, they can be mut, and they are not required to be Sync + Send.
+
+Tantivy 0.12.0
+======================
+- Removing static dispatch in tokenizers for simplicity. (#762)
+- Added backward iteration for `TermDictionary` stream. (@halvorboe)
+- Fixed a performance issue when searching for the posting lists of a missing term (@audunhalland)
+- Added a configurable maximum number of docs (10M by default) for a segment to be considered for merge (@hntd187, landed by @halvorboe #713) 
+- Important Bugfix #777, causing tantivy to retain memory mapping. (diagnosed by @poljar)
+- Added support for field boosting. (#547, @fulmicoton)
+
+## How to update?
+
+Crates relying on custom tokenizer, or registering tokenizer in the manager will require some 
+minor changes. Check https://github.com/tantivy-search/tantivy/blob/master/examples/custom_tokenizer.rs
+to check for some code sample.
+
+Tantivy 0.11.3
+=======================
+- Fixed DateTime as a fast field (#735)
+
+Tantivy 0.11.2
+=======================
+- The future returned by `IndexWriter::merge` does not borrow `self` mutably anymore (#732)
+- Exposing a constructor for `WatchHandle` (#731)
+
+Tantivy 0.11.1
+=====================
+- Bug fix #729
+
+
+Tantivy 0.11.0
+=====================
+
+- Added f64 field. Internally reuse u64 code the same way i64 does (@fdb-hiroshima)
+- Various bugfixes in the query parser.
+    - Better handling of hyphens in query parser. (#609)
+    - Better handling of whitespaces.
+- Closes #498 - add support for Elastic-style unbounded range queries for alphanumeric types eg. "title:>hello", "weight:>=70.5", "height:<200" (@petr-tik)
+- API change around `Box<BoxableTokenizer>`. See detail in #629
+- Avoid rebuilding Regex automaton whenever a regex query is reused. #639 (@brainlock)
+- Add footer with some metadata to index files. #605 (@fdb-hiroshima)
+- Add a method to check the compatibility of the footer in the index with the running version of tantivy (@petr-tik)
+- TopDocs collector: ensure stable sorting on equal score. #671 (@brainlock)
+- Added handling of pre-tokenized text fields (#642), which will enable users to
+  load tokens created outside tantivy. See usage in examples/pre_tokenized_text. (@kkoziara)
+- Fix crash when committing multiple times with deleted documents. #681 (@brainlock)
+
+## How to update?
+
+- The index format is changed. You are required to reindex your data to use tantivy 0.11. 
+- `Box<dyn BoxableTokenizer>` has been replaced by a `BoxedTokenizer` struct.
+- Regex are now compiled when the `RegexQuery` instance is built. As a result, it can now return
+an error and handling the `Result` is required.
+- `tantivy::version()` now returns a `Version` object. This object implements `ToString()`
+
+Tantivy 0.10.2
+=====================
+
+- Closes #656. Solving memory leak.
+
+Tantivy 0.10.1
+=====================
+
+- Closes #544.  A few users experienced problems with the directory watching system.
+Avoid watching the mmap directory until someone effectively creates a reader that uses
+this functionality.
+
+
 Tantivy 0.10.0
 =====================
 
